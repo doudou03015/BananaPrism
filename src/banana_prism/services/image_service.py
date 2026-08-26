@@ -1,0 +1,464 @@
+"""Qt event-loop based image generation/edit job service."""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Callable, Sequence
+from urllib.parse import urlsplit
+
+from PySide6.QtCore import QByteArray, QObject, QThread, QTimer, QUrl, Signal
+from PySide6.QtNetwork import (
+    QHostInfo,
+    QNetworkAccessManager,
+    QNetworkReply,
+    QNetworkRequest,
+)
+
+from banana_prism.constants import (
+    MAX_IMAGE_PIXELS,
+    MAX_RESPONSE_BYTES,
+    REMOTE_IMAGE_TIMEOUT_MS,
+    REQUEST_TIMEOUT_MS,
+)
+from banana_prism.models import JobState
+from banana_prism.services.api_client import (
+    ApiClient,
+    ApiClientError,
+    ApiRequest,
+    ApiResult,
+    UnsafeImageUrlError,
+    ensure_public_addresses,
+    validate_image_bytes,
+    validate_remote_image_url_syntax,
+)
+
+
+class TerminalState(str, Enum):
+    SUCCESS = "success"
+    ERROR = "error"
+    TEXT_ONLY = "text_only"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class StartResult:
+    accepted: bool
+    job_id: str | None
+    reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+
+HostLookup = Callable[
+    [str, Callable[[Sequence[str] | Exception], None]],
+    Any,
+]
+
+
+class ImageService(QObject):
+    """Run one cancellable request at a time without blocking the UI thread.
+
+    Every accepted ``job_id`` emits exactly one of ``success``, ``error``,
+    ``text_only`` or ``cancelled``.  The service clears its active job before that
+    signal is emitted, so queue controllers may safely start the next job directly
+    from a terminal signal handler.
+    """
+
+    started = Signal(str)
+    state_changed = Signal(str, object)  # job_id, JobState
+    progress = Signal(str, int, int)  # job_id, received bytes, total (-1 unknown)
+    success = Signal(str, object)  # job_id, ApiResult
+    error = Signal(str, str)
+    text_only = Signal(str, str)
+    cancelled = Signal(str)
+    terminal = Signal(str, object)  # job_id, TerminalState
+
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        network_manager: QNetworkAccessManager | None = None,
+        host_lookup: HostLookup | None = None,
+        request_timeout_ms: int = REQUEST_TIMEOUT_MS,
+        remote_timeout_ms: int = REMOTE_IMAGE_TIMEOUT_MS,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
+        max_image_pixels: int = MAX_IMAGE_PIXELS,
+        max_redirects: int = 5,
+    ) -> None:
+        super().__init__(parent)
+        self._manager = network_manager or QNetworkAccessManager(self)
+        self._host_lookup = host_lookup or self._qt_host_lookup
+        self._request_timeout_ms = max(1, int(request_timeout_ms))
+        self._remote_timeout_ms = max(1, int(remote_timeout_ms))
+        self._max_response_bytes = max(1, int(max_response_bytes))
+        self._max_image_pixels = max(1, int(max_image_pixels))
+        self._max_redirects = max(0, int(max_redirects))
+
+        self._state = JobState.IDLE
+        self._job_id: str | None = None
+        self._api_request: ApiRequest | None = None
+        self._reply: QNetworkReply | Any | None = None
+        self._buffer = bytearray()
+        self._stage = ""
+        self._terminal_emitted = False
+        self._parsed_result: ApiResult | None = None
+        self._remote_original_url: str | None = None
+
+        self._timeout = QTimer(self)
+        self._timeout.setSingleShot(True)
+        self._timeout.timeout.connect(self._on_timeout)
+
+    @property
+    def state(self) -> JobState:
+        return self._state
+
+    @property
+    def current_job_id(self) -> str | None:
+        return self._job_id
+
+    @property
+    def busy(self) -> bool:
+        return self._job_id is not None
+
+    def start(self, request: ApiRequest) -> StartResult:
+        self._assert_owning_thread()
+        if self._job_id is not None:
+            return StartResult(False, self._job_id, "busy")
+        if not isinstance(request, ApiRequest):
+            raise TypeError("request must be an ApiRequest")
+
+        job_id = uuid.uuid4().hex
+        self._job_id = job_id
+        self._api_request = request
+        self._terminal_emitted = False
+        self._parsed_result = None
+        self._remote_original_url = None
+        self._set_state(JobState.RUNNING)
+        if self._job_id != job_id:
+            return StartResult(True, job_id)
+        self.started.emit(job_id)
+        if self._job_id != job_id:
+            return StartResult(True, job_id)
+        try:
+            self._start_api_request(request)
+        except Exception as exc:
+            self._finish(TerminalState.ERROR, self._safe_error(exc))
+        return StartResult(True, job_id)
+
+    def start_generation(self, **kwargs: Any) -> StartResult:
+        return self.start(ApiClient.build_generation_request(**kwargs))
+
+    def start_edit(self, **kwargs: Any) -> StartResult:
+        return self.start(ApiClient.build_edit_request(**kwargs))
+
+    def cancel(self, job_id: str | None = None) -> bool:
+        self._assert_owning_thread()
+        if self._job_id is None or (job_id is not None and job_id != self._job_id):
+            return False
+        self._set_state(JobState.CANCELLING)
+        self._finish(TerminalState.CANCELLED)
+        return True
+
+    def close(self) -> None:
+        """Cancel active work; child Qt objects are then safely deletable."""
+
+        if self._job_id is not None:
+            self.cancel(self._job_id)
+
+    def _assert_owning_thread(self) -> None:
+        if QThread.currentThread() != self.thread():
+            raise RuntimeError("ImageService must be used from its owning Qt thread")
+
+    def _set_state(self, state: JobState) -> None:
+        self._state = state
+        if self._job_id:
+            self.state_changed.emit(self._job_id, state)
+
+    def _make_request(self, url: QUrl | str, timeout_ms: int) -> QNetworkRequest:
+        request = QNetworkRequest(QUrl(url) if isinstance(url, str) else url)
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.ManualRedirectPolicy,
+        )
+        request.setTransferTimeout(timeout_ms)
+        return request
+
+    def _start_api_request(self, spec: ApiRequest) -> None:
+        request = self._make_request(spec.url, self._request_timeout_ms)
+        for name, value in spec.headers.items():
+            request.setRawHeader(name.encode("ascii"), value.encode("utf-8"))
+        self._stage = "api"
+        self._buffer.clear()
+        reply = self._manager.post(request, QByteArray(spec.body))
+        self._attach_reply(reply, self._request_timeout_ms)
+
+    def _attach_reply(self, reply: Any, timeout_ms: int) -> None:
+        if self._job_id is None:
+            try:
+                reply.abort()
+            finally:
+                reply.deleteLater()
+            return
+        self._reply = reply
+        reply.readyRead.connect(lambda r=reply: self._read_available(r))
+        reply.finished.connect(lambda r=reply: self._reply_finished(r))
+        if hasattr(reply, "downloadProgress"):
+            reply.downloadProgress.connect(
+                lambda received, total, r=reply: self._emit_progress(r, received, total)
+            )
+        if hasattr(reply, "metaDataChanged"):
+            reply.metaDataChanged.connect(lambda r=reply: self._metadata_changed(r))
+        self._timeout.start(timeout_ms)
+
+    def _emit_progress(self, reply: Any, received: int, total: int) -> None:
+        if reply is self._reply and self._job_id:
+            self.progress.emit(self._job_id, int(received), int(total))
+
+    def _metadata_changed(self, reply: Any) -> None:
+        if reply is not self._reply or self._job_id is None:
+            return
+        raw_length = bytes(reply.rawHeader(b"Content-Length"))
+        if raw_length:
+            try:
+                length = int(raw_length)
+            except ValueError:
+                self._finish(TerminalState.ERROR, "Invalid Content-Length header")
+                return
+            if length < 0 or length > self._max_response_bytes:
+                self._finish(
+                    TerminalState.ERROR,
+                    "Network response exceeds the configured size limit",
+                )
+
+    def _read_available(self, reply: Any) -> None:
+        if reply is not self._reply or self._job_id is None:
+            return
+        self._buffer.extend(bytes(reply.readAll()))
+        if len(self._buffer) > self._max_response_bytes:
+            self._finish(
+                TerminalState.ERROR,
+                "Network response exceeds the configured size limit",
+            )
+
+    def _reply_finished(self, reply: Any) -> None:
+        if reply is not self._reply or self._job_id is None:
+            return
+        self._read_available(reply)
+        if reply is not self._reply:  # size validation may have terminated the job
+            return
+        self._timeout.stop()
+        status_value = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        status = int(status_value) if status_value is not None else 0
+        network_error = reply.error() if hasattr(reply, "error") else 0
+        stage = self._stage
+        data = bytes(self._buffer)
+
+        if stage == "remote":
+            target = reply.attribute(QNetworkRequest.Attribute.RedirectionTargetAttribute)
+            if target and status in {301, 302, 303, 307, 308}:
+                original = self._remote_original_url or ""
+                next_url = QUrl(original).resolved(QUrl(target)).toString()
+                redirects = int(reply.property("banana_redirect_count") or 0)
+                self._release_reply(reply)
+                if redirects >= self._max_redirects:
+                    self._finish(TerminalState.ERROR, "Too many remote image redirects")
+                else:
+                    self._begin_remote_download(next_url, redirects + 1)
+                return
+
+        self._release_reply(reply)
+        if network_error not in (0, QNetworkReply.NetworkError.NoError):
+            message = self._safe_error(reply.errorString())
+            self._finish(TerminalState.ERROR, f"Network request failed: {message}")
+            return
+
+        try:
+            if stage == "api":
+                assert self._api_request is not None
+                parsed = ApiClient.parse_response(
+                    provider=self._api_request.provider,
+                    body=data,
+                    status_code=status,
+                    max_response_bytes=self._max_response_bytes,
+                    max_image_pixels=self._max_image_pixels,
+                )
+                self._parsed_result = parsed
+                if parsed.image is not None:
+                    self._finish(TerminalState.SUCCESS, parsed)
+                elif parsed.remote_image_url:
+                    self._begin_remote_download(parsed.remote_image_url, 0)
+                elif parsed.text:
+                    self._finish(TerminalState.TEXT_ONLY, parsed.text)
+                else:
+                    self._finish(
+                        TerminalState.ERROR,
+                        "Provider returned neither an image nor text",
+                    )
+            else:
+                self._complete_remote_download(data, status, reply)
+        except Exception as exc:
+            self._finish(TerminalState.ERROR, self._safe_error(exc))
+
+    def _begin_remote_download(self, url: str, redirect_count: int) -> None:
+        if self._job_id is None:
+            return
+        try:
+            host, _port = validate_remote_image_url_syntax(url)
+        except UnsafeImageUrlError as exc:
+            self._finish(TerminalState.ERROR, self._safe_error(exc))
+            return
+        job_id = self._job_id
+        self._stage = "resolving"
+        self._timeout.start(self._remote_timeout_ms)
+
+        def resolved(result: Sequence[str] | Exception) -> None:
+            if self._job_id != job_id or self._terminal_emitted:
+                return
+            if isinstance(result, Exception):
+                self._finish(TerminalState.ERROR, self._safe_error(result))
+                return
+            try:
+                addresses = ensure_public_addresses(result)
+                self._start_pinned_download(url, host, addresses[0], redirect_count)
+            except Exception as exc:
+                self._finish(TerminalState.ERROR, self._safe_error(exc))
+
+        try:
+            self._host_lookup(host, resolved)
+        except Exception as exc:
+            self._finish(TerminalState.ERROR, self._safe_error(exc))
+
+    @staticmethod
+    def _qt_host_lookup(
+        host: str, callback: Callable[[Sequence[str] | Exception], None]
+    ) -> None:
+        def completed(info: QHostInfo) -> None:
+            if info.error() != QHostInfo.HostInfoError.NoError:
+                callback(UnsafeImageUrlError("Remote image host could not be resolved"))
+                return
+            callback([address.toString() for address in info.addresses()])
+
+        QHostInfo.lookupHost(host, completed)
+
+    def _start_pinned_download(
+        self, original_url: str, original_host: str, address: str, redirect_count: int
+    ) -> None:
+        parsed = urlsplit(original_url)
+        self._timeout.stop()
+        pinned = QUrl(original_url)
+        pinned.setHost(address)
+        request = self._make_request(pinned, self._remote_timeout_ms)
+
+        host_header = original_host
+        if parsed.port and parsed.port != 443:
+            host_header = f"{host_header}:{parsed.port}"
+        request.setRawHeader(b"Host", host_header.encode("idna"))
+        # Keep TLS certificate verification/SNI bound to the original hostname
+        # while the request URL is pinned to the already-vetted IP address.
+        request.setPeerVerifyName(original_host)
+
+        self._stage = "remote"
+        self._remote_original_url = original_url
+        self._buffer.clear()
+        reply = self._manager.get(request)
+        reply.setProperty("banana_redirect_count", redirect_count)
+        self._attach_reply(reply, self._remote_timeout_ms)
+
+    def _complete_remote_download(self, data: bytes, status: int, reply: Any) -> None:
+        if status != 200:
+            raise ApiClientError(f"Remote image returned HTTP {status}")
+        content_type = bytes(reply.rawHeader(b"Content-Type")).decode(
+            "ascii", "ignore"
+        )
+        if not content_type.lower().startswith("image/"):
+            raise ApiClientError("Remote response Content-Type is not an image")
+        image = validate_image_bytes(
+            data,
+            content_type,
+            max_bytes=self._max_response_bytes,
+            max_pixels=self._max_image_pixels,
+        )
+        previous = self._parsed_result or ApiResult()
+        result = ApiResult(
+            text=previous.text,
+            image=image,
+            input_tokens=previous.input_tokens,
+            output_tokens=previous.output_tokens,
+        )
+        self._finish(TerminalState.SUCCESS, result)
+
+    def _on_timeout(self) -> None:
+        if self._job_id is not None:
+            self._finish(TerminalState.ERROR, "Network request timed out")
+
+    def _release_reply(self, reply: Any) -> None:
+        if reply is not self._reply:
+            return
+        self._reply = None
+        self._buffer.clear()
+        try:
+            reply.readyRead.disconnect()
+            reply.finished.disconnect()
+            if hasattr(reply, "downloadProgress"):
+                reply.downloadProgress.disconnect()
+            if hasattr(reply, "metaDataChanged"):
+                reply.metaDataChanged.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        reply.deleteLater()
+
+    def _finish(self, terminal: TerminalState, payload: Any = None) -> None:
+        if self._job_id is None or self._terminal_emitted:
+            return
+        self._terminal_emitted = True
+        job_id = self._job_id
+        reply = self._reply
+        self._reply = None
+        self._timeout.stop()
+        self._buffer.clear()
+        self._api_request = None
+        self._parsed_result = None
+        self._remote_original_url = None
+        self._stage = ""
+        self._job_id = None
+        self._state = JobState.IDLE
+
+        if reply is not None:
+            try:
+                reply.readyRead.disconnect()
+                reply.finished.disconnect()
+                if hasattr(reply, "downloadProgress"):
+                    reply.downloadProgress.disconnect()
+                if hasattr(reply, "metaDataChanged"):
+                    reply.metaDataChanged.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+            try:
+                reply.abort()
+            except RuntimeError:
+                pass
+            reply.deleteLater()
+
+        # IDLE is announced before the terminal event; starting the next job from
+        # any terminal handler is therefore deterministic and never sees "busy".
+        self.state_changed.emit(job_id, JobState.IDLE)
+        if terminal is TerminalState.SUCCESS:
+            self.success.emit(job_id, payload)
+        elif terminal is TerminalState.TEXT_ONLY:
+            self.text_only.emit(job_id, str(payload or ""))
+        elif terminal is TerminalState.CANCELLED:
+            self.cancelled.emit(job_id)
+        else:
+            self.error.emit(job_id, str(payload or "Unknown error"))
+        self.terminal.emit(job_id, terminal)
+
+    @staticmethod
+    def _safe_error(error: Any) -> str:
+        message = str(error).replace("\r", " ").replace("\n", " ").strip()
+        return message[:500] or "Unknown error"
+
+
+__all__ = ["ImageService", "JobState", "StartResult", "TerminalState"]

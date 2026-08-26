@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="BananaPrism">
+  <defs>
+    <linearGradient id="bg" x1="20" y1="18" x2="232" y2="238" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171A24"/>
+      <stop offset="1" stop-color="#090A0F"/>
+    </linearGradient>
+    <linearGradient id="spectrum" x1="86" y1="67" x2="211" y2="196" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F5D547"/>
+      <stop offset=".48" stop-color="#48D8E8"/>
+      <stop offset="1" stop-color="#C96BFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#bg)" stroke="#303544" stroke-width="8"/>
+  <path d="M71 48c14 3 22 14 21 28" fill="none" stroke="#FFF2A6" stroke-width="12" stroke-linecap="round"/>
+  <path d="M69 60c-4 48 16 92 55 112 29 15 62 14 83-2-17 42-62 64-105 48C52 199 27 145 42 94 48 76 57 65 69 60Z" fill="#F5D547"/>
+  <path d="M71 78c2 57 42 104 104 104-20 17-51 21-79 8-40-19-59-66-43-103 5-10 11-16 18-9Z" fill="#FFD95A" opacity=".5"/>
+  <path d="M132 72 211 194H80Z" fill="#10131B" stroke="url(#spectrum)" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M132 72v122M132 72 80 194M132 72l79 122" stroke="url(#spectrum)" stroke-width="4" opacity=".9"/>
+</svg>
+

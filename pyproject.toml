@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "banana-prism"
+version = "1.0.0"
+description = "BananaPrism — AI 图像工作室"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "PySide6>=6.11,<6.12",
+]
+
+[project.optional-dependencies]
+dev = [
+  "Pillow>=12,<13",
+  "pytest>=9,<10",
+  "pyinstaller>=6.20,<7",
+]
+
+[project.gui-scripts]
+banana-prism = "banana_prism.application:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider --basetemp=.tmp_pytest"
+testpaths = ["tests"]
+pythonpath = ["src"]
