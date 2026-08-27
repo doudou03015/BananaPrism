@@ -88,6 +88,7 @@ from banana_prism.models import (
 )
 from banana_prism.services.log_service import redact_for_display
 from banana_prism.ui.dialogs.console_dialog import ConsoleDialog
+from banana_prism.ui.widgets.wheel_safe_combo_box import WheelSafeComboBox
 from banana_prism.ui.dialogs.password_dialog import PasswordDialog
 from banana_prism.ui.dialogs.preflight_dialog import PreflightDialog
 from banana_prism.ui.widgets.image_preview import ImagePreview
@@ -332,7 +333,7 @@ class MainWindow(QMainWindow):
 
     def _build_parameters_card(self) -> QWidget:
         frame, layout = self._card(tr("main.card.parameters"))
-        self._preset_combo = QComboBox()
+        self._preset_combo = WheelSafeComboBox()
         self._preset_combo.setObjectName("presetCombo")
         self._preset_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -343,7 +344,7 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Fixed,
         )
         self._preset_combo.currentIndexChanged.connect(self._on_preset_changed)
-        self._model_combo = QComboBox()
+        self._model_combo = WheelSafeComboBox()
         self._model_combo.setObjectName("modelCombo")
         self._model_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -356,7 +357,7 @@ class MainWindow(QMainWindow):
         for model in MODELS:
             self._model_combo.addItem(tr(model.label_key), model.model_id)
         self._model_combo.currentIndexChanged.connect(self._on_model_changed)
-        self._size_combo = QComboBox()
+        self._size_combo = WheelSafeComboBox()
         self._size_combo.setObjectName("sizeCombo")
         self._size_combo.addItems(SIZES)
         self._size_combo.currentIndexChanged.connect(self._on_output_geometry_changed)
@@ -392,14 +393,14 @@ class MainWindow(QMainWindow):
         export_grid.setSpacing(5)
         export_grid.addWidget(QLabel(tr("main.field.output_format")), 0, 0)
         export_grid.addWidget(QLabel(tr("main.field.output_dpi")), 0, 1)
-        self._output_format_combo = QComboBox()
+        self._output_format_combo = WheelSafeComboBox()
         self._output_format_combo.setObjectName("outputFormatCombo")
         for label, value in _OUTPUT_FORMATS:
             self._output_format_combo.addItem(label, value)
         self._output_format_combo.currentIndexChanged.connect(
             self._persist_parameter_choices
         )
-        self._output_dpi_combo = QComboBox()
+        self._output_dpi_combo = WheelSafeComboBox()
         self._output_dpi_combo.setObjectName("outputDpiCombo")
         for value in _OUTPUT_DPIS:
             self._output_dpi_combo.addItem(f"{value} DPI", value)
@@ -508,7 +509,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(brush_row)
         color_row = QHBoxLayout()
         color_row.addWidget(QLabel(tr("main.field.annotation_color")))
-        self._annotation_color_combo = QComboBox()
+        self._annotation_color_combo = WheelSafeComboBox()
         self._annotation_color_combo.setObjectName("annotationColorCombo")
         for color_id, spec in ANNOTATION_COLORS.items():
             self._annotation_color_combo.addItem(tr(spec.label_key), color_id)

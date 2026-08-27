@@ -6,7 +6,6 @@ from uuid import uuid4
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -20,6 +19,7 @@ from PySide6.QtWidgets import (
 from banana_prism.constants import API_PROVIDERS
 from banana_prism.i18n import tr
 from banana_prism.models import ApiPreset
+from banana_prism.ui.widgets.wheel_safe_combo_box import WheelSafeComboBox
 
 
 class ApiPresetDialog(QDialog):
@@ -42,7 +42,7 @@ class ApiPresetDialog(QDialog):
         self.name_edit = QLineEdit(preset.name if preset else "")
         self.name_edit.setObjectName("presetNameEdit")
         self.name_edit.setPlaceholderText(tr("api_preset.placeholder.name"))
-        self.provider_combo = QComboBox()
+        self.provider_combo = WheelSafeComboBox()
         self.provider_combo.setObjectName("providerCombo")
         for provider_id, spec in API_PROVIDERS.items():
             self.provider_combo.addItem(spec.label, provider_id)
