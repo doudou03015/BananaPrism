@@ -185,7 +185,7 @@ def test_edit_payloads_preserve_recovered_provider_differences() -> None:
     assert content[2]["text"] == (
         "IMAGE 2 — ANNOTATION GUIDE (bright red overlay = region to edit)."
     )
-    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
     aihubmix = ApiClient.build_edit_request(provider="aihubmix", **common)
     parts = aihubmix.payload["contents"][0]["parts"]
@@ -193,10 +193,11 @@ def test_edit_payloads_preserve_recovered_provider_differences() -> None:
         "text": "IMAGE 2 — ANNOTATION GUIDE (bright red overlay = region to edit)."
     }
     assert parts[2]["text"] == content[2]["text"]
-    assert parts[1]["inlineData"]["mimeType"] == "image/png"
-    assert parts[3]["inlineData"]["data"] == base64.b64encode(annotated).decode(
-        "ascii"
-    )
+    assert parts[1]["inlineData"]["mimeType"] == "image/jpeg"
+    wire_annotation = base64.b64decode(parts[3]["inlineData"]["data"])
+    assert QImage.fromData(wire_annotation).size() == QImage.fromData(
+        annotated
+    ).size()
 
 
 def test_openrouter_4k_edit_uses_ordered_images_api_references() -> None:
@@ -222,18 +223,20 @@ def test_openrouter_4k_edit_uses_ordered_images_api_references() -> None:
     references = request.payload["input_references"]
     assert len(references) == 2
     assert all(reference["type"] == "image_url" for reference in references)
-    assert references[0]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert references[1]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert base64.b64decode(
+    assert references[0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert references[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    wire_original = base64.b64decode(
         references[0]["image_url"]["url"].split(",", 1)[1], validate=True
-    ) == original
-    assert base64.b64decode(
+    )
+    wire_annotation = base64.b64decode(
         references[1]["image_url"]["url"].split(",", 1)[1], validate=True
-    ) == annotated
+    )
+    assert QImage.fromData(wire_original).size() == QImage.fromData(original).size()
+    assert QImage.fromData(wire_annotation).size() == QImage.fromData(annotated).size()
 
 
 @pytest.mark.parametrize("provider", ["openrouter", "aihubmix"])
-def test_edit_payload_adds_authoritative_binary_mask_and_dynamic_color(
+def test_edit_payload_uses_color_guide_and_keeps_binary_mask_off_wire(
     provider: str,
 ) -> None:
     original = png_bytes(5, 4)
@@ -254,18 +257,18 @@ def test_edit_payload_adds_authoritative_binary_mask_and_dynamic_color(
 
     if provider == "openrouter":
         references = request.payload["input_references"]
-        assert len(references) == 3
+        assert len(references) == 2
         prompt = request.payload["prompt"]
         assert "bright red" in prompt
-        assert "WHITE = edit; BLACK = preserve" in prompt
-        encoded = references[2]["image_url"]["url"].split(",", 1)[1]
+        assert "exactly TWO images" in prompt
     else:
         parts = request.payload["contents"][0]["parts"]
-        assert len(parts) == 6
+        assert len(parts) == 4
         assert "bright red" in parts[0]["text"]
-        assert "WHITE = edit; BLACK = preserve" in parts[4]["text"]
-        encoded = parts[5]["inlineData"]["data"]
-    assert base64.b64decode(encoded, validate=True) == mask
+        assert "exactly TWO images" in parts[0]["text"]
+    assert "IMAGE 3" not in request.body.decode("utf-8")
+    assert "BINARY SELECTION MASK" not in request.body.decode("utf-8")
+    assert base64.b64encode(mask) not in request.body
 
 
 def test_edit_payload_rejects_unknown_annotation_color() -> None:
@@ -312,7 +315,7 @@ def test_edit_payload_rejects_misaligned_guide_and_mask() -> None:
         )
 
 
-def test_bmp_edit_inputs_are_normalized_to_provider_compatible_png() -> None:
+def test_bmp_edit_inputs_are_normalized_to_provider_compatible_jpeg() -> None:
     common = dict(
         api_key="test-key",
         model_id="google/a-current-model",
@@ -324,16 +327,16 @@ def test_bmp_edit_inputs_are_normalized_to_provider_compatible_png() -> None:
     )
     openrouter = ApiClient.build_edit_request(provider="openrouter", **common)
     url = openrouter.payload["messages"][0]["content"][1]["image_url"]["url"]
-    assert url.startswith("data:image/png;base64,")
+    assert url.startswith("data:image/jpeg;base64,")
     assert base64.b64decode(url.split(",", 1)[1], validate=True).startswith(
-        b"\x89PNG\r\n\x1a\n"
+        b"\xff\xd8"
     )
 
     aihubmix = ApiClient.build_edit_request(provider="aihubmix", **common)
     inline = aihubmix.payload["contents"][0]["parts"][1]["inlineData"]
-    assert inline["mimeType"] == "image/png"
+    assert inline["mimeType"] == "image/jpeg"
     assert base64.b64decode(inline["data"], validate=True).startswith(
-        b"\x89PNG\r\n\x1a\n"
+        b"\xff\xd8"
     )
 
 

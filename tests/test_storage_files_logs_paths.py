@@ -214,6 +214,8 @@ def test_edit_sidecar_records_actual_output_dpi_not_source_dpi(tmp_path: Path) -
     assert metadata["preset_id"] == "preset_xyz"
     assert metadata["annotation_color"] == "green"
     assert metadata["selection_mask_format"] == "png"
+    assert metadata["selection_mask_uploaded"] is False
+    assert metadata["wire_reference_count"] == 2
 
 
 def test_failed_or_unsupported_reencode_does_not_invent_output_dpi(tmp_path: Path) -> None:

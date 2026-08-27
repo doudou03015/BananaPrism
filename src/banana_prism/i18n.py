@@ -151,7 +151,7 @@ _ZH_CN = {
     "preflight.subheading": "确认后将使用下列精确参数调用当前 API 预设。",
     "preflight.preview.source": "原图",
     "preflight.preview.annotation": "彩色标注图",
-    "preflight.preview.mask": "黑白选区蒙版",
+    "preflight.preview.mask": "本地黑白选区蒙版（不上传）",
     "preflight.button.send": "确认发送",
     "preflight.button.back": "返回修改",
     "preflight.prompt": "提示词",
@@ -166,15 +166,17 @@ _ZH_CN = {
     "preflight.field.output_format": "保存格式",
     "preflight.field.output_dpi": "保存 DPI",
     "preflight.field.source_format": "原文件 / 编辑输出格式",
-    "preflight.field.wire_source_format": "上传源图格式",
+    "preflight.field.wire_source_format": "上传源图副本格式",
     "preflight.field.source_dpi": "源 DPI",
-    "preflight.field.annotation_format": "标注格式",
+    "preflight.field.annotation_format": "上传标注副本格式",
     "preflight.field.annotation_color": "标注颜色",
     "preflight.field.selection_mask": "选区蒙版",
+    "preflight.field.wire_policy": "网络副本策略",
     "preflight.operation.generate": "生成图片",
     "preflight.operation.edit": "局部编辑",
-    "preflight.annotation_format.png": "PNG",
-    "preflight.selection_mask.png": "黑底白区 PNG（白色区域允许修改）",
+    "preflight.annotation_format.jpeg": "JPEG 95",
+    "preflight.selection_mask.local": "本地 PNG（仅生成/校验彩色标注，不上传）",
+    "preflight.wire_policy.adaptive": "原图与标注图保持同尺寸；请求超过 16 MiB 时同步等比缩小",
 
     # Reusable panels and preview.
     "log_panel.title": "运行日志",
@@ -300,7 +302,7 @@ _ZH_CN = {
     "main.annotation.color.cyan": "青色",
     "main.annotation.color.yellow": "黄色",
     "main.annotation.note": (
-        "{color}标记用于直观预览；同时发送无损黑白选区蒙版，白色区域才允许修改。"
+        "{color}标记会合成到网络标注副本；黑白蒙版仅在本地用于生成和校验标注，不会上传。"
     ),
     "main.edit.placeholder": "说明标记区域中要修改的内容…",
     "main.button.send_edit": "发送编辑请求",
@@ -398,7 +400,7 @@ _ZH_CN = {
     "main.directory.save_unavailable": "保存目录当前不可用：\n{directory}",
     "main.edit.needs_source": "局部编辑需要工作图 · 点击“导入工作图”",
     "main.edit.entered_without_source": "已进入局部编辑，请先导入工作图。",
-    "main.annotation.ready": "{color}标注与黑白蒙版已就绪",
+    "main.annotation.ready": "{color}标注与本地黑白蒙版已就绪",
     "main.annotation.cleared": "标注已清除",
     "main.cancel.cancelling_ellipsis": "正在取消…",
     "main.cancel.cancelling": "正在取消",

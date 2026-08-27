@@ -1144,8 +1144,6 @@ class MainWindow(QMainWindow):
             )
             return False
         model = self._current_model()
-        detected_source_fmt = detect_image_format(self._work_bytes)
-        wire_source_fmt = "png" if detected_source_fmt == "bmp" else detected_source_fmt
         request = EditRequest(
             source_image_bytes=self._work_bytes,
             annotated_image_bytes=annotated,
@@ -1158,7 +1156,10 @@ class MainWindow(QMainWindow):
             provider=preset.provider,
             source_fmt=self._work_fmt,
             source_dpi=self._work_source_dpi,
-            wire_source_fmt=wire_source_fmt,
+            # ApiClient creates two JPEG 95 wire copies and may synchronously
+            # downscale both by the same factor to stay below its upload budget.
+            # The original/local working bytes remain untouched.
+            wire_source_fmt="jpeg",
             selection_mask_bytes=selection_mask,
             annotation_color=self._selected_annotation_color(),
             requested_output_format=self._selected_output_format(),

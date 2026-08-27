@@ -154,7 +154,7 @@ class PreflightDialog(QDialog):
                     if request.source_dpi
                     else tr("common.not_provided"),
                     tr("preflight.field.annotation_format"): tr(
-                        "preflight.annotation_format.png"
+                        "preflight.annotation_format.jpeg"
                     ),
                     tr("preflight.field.annotation_color"): (
                         tr(annotation.label_key)
@@ -162,7 +162,10 @@ class PreflightDialog(QDialog):
                         else request.annotation_color
                     ),
                     tr("preflight.field.selection_mask"): tr(
-                        "preflight.selection_mask.png"
+                        "preflight.selection_mask.local"
+                    ),
+                    tr("preflight.field.wire_policy"): tr(
+                        "preflight.wire_policy.adaptive"
                     ),
                 }
                 if isinstance(request, EditRequest)

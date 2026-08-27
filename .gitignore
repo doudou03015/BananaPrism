@@ -9,3 +9,11 @@ dist/
 *.log
 *.tmp
 .coverage
+
+# Local runtime profiles and credentials must never be published.
+settings.json
+secrets*.dpapi
+logs/
+.env
+.env.*
+!.env.example

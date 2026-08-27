@@ -360,7 +360,7 @@ def test_edit_mandatory_preflight_sends_same_request_and_png_guide(
     assert kwargs["aspect_ratio"] == "3:2"
     assert captured[0] is window._current_job.request
     assert captured[0].source_dpi == (144.0, 144.0)
-    assert captured[0].wire_source_fmt == "png"
+    assert captured[0].wire_source_fmt == "jpeg"
     assert captured[0].selection_mask_bytes == kwargs["selection_mask"]
     assert captured[0].annotation_color == "green"
     service.cancel()

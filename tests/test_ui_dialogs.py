@@ -44,18 +44,21 @@ def test_edit_preflight_declares_guide_mask_export_and_source_metadata(app: QApp
     request = EditRequest(
         b"source", b"guide", "replace", "m", "short", "4K", "3:4", "p", "aihubmix",
         source_fmt="webp", source_dpi=(144.0, 144.0),
-        wire_source_fmt="png",
+        wire_source_fmt="jpeg",
     )
     dialog = PreflightDialog(request, source_image=image, annotated_image=image)
     assert dialog.request is request
     assert dialog.summary["尺寸"] == "4K"
     assert dialog.summary["比例"] == "3:4"
     assert dialog.summary["原文件 / 编辑输出格式"] == "WEBP"
-    assert dialog.summary["上传源图格式"] == "PNG"
+    assert dialog.summary["上传源图副本格式"] == "JPEG"
     assert dialog.summary["源 DPI"] == "144 × 144"
-    assert dialog.summary["标注格式"] == "PNG"
+    assert dialog.summary["上传标注副本格式"] == "JPEG 95"
     assert dialog.summary["标注颜色"] == "红色"
-    assert dialog.summary["选区蒙版"] == "黑底白区 PNG（白色区域允许修改）"
+    assert dialog.summary["选区蒙版"] == "本地 PNG（仅生成/校验彩色标注，不上传）"
+    assert dialog.summary["网络副本策略"] == (
+        "原图与标注图保持同尺寸；请求超过 16 MiB 时同步等比缩小"
+    )
     assert dialog.summary["保存格式"] == "PNG"
     assert dialog.summary["保存 DPI"] == "300 DPI"
 

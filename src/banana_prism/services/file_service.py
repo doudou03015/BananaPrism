@@ -345,6 +345,11 @@ class FileService:
             common["selection_mask_format"] = (
                 "png" if request.selection_mask_bytes else None
             )
+            # The mask remains useful provenance, but it is not a provider
+            # reference.  Record that distinction explicitly so older sidecar
+            # readers do not infer transport merely from the retained format.
+            common["selection_mask_uploaded"] = False
+            common["wire_reference_count"] = 2
             common["source_fmt"] = _normalise_format(request.source_fmt)
             common["wire_source_fmt"] = (
                 _normalise_format(request.wire_source_fmt)

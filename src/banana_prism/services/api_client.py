@@ -19,16 +19,14 @@ from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from urllib.parse import quote, urlsplit
 
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice
-from PySide6.QtGui import QImage, QImageReader
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, Qt
+from PySide6.QtGui import QImage, QImageReader, QPainter
 
 from banana_prism.constants import (
     MAX_IMAGE_PIXELS,
     MAX_RESPONSE_BYTES,
     SIZES,
 )
-
-
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_IMAGES_URL = "https://openrouter.ai/api/v1/images"
 AIHUBMIX_URL = "https://api.aihubmix.com/gemini/v1beta"
@@ -37,6 +35,9 @@ _DATA_URI_RE = re.compile(
     re.IGNORECASE,
 )
 _SUPPORTED_FORMATS = {"png", "jpeg", "jpg", "webp", "bmp"}
+_EDIT_BODY_TARGET_BYTES = 16 * 1024 * 1024
+_WIRE_JPEG_QUALITY = 95
+_MAX_WIRE_EDGE = 32_768
 _ANNOTATION_PROMPT_COLORS = {
     "red": "bright red",
     "green": "bright green",
@@ -132,36 +133,27 @@ def _validate_api_key(api_key: str) -> str:
     return key
 
 
-def _edit_instruction(annotation_color: str, *, has_mask: bool) -> tuple[str, str, str]:
+def _edit_instruction(annotation_color: str) -> tuple[str, str]:
     color = _ANNOTATION_PROMPT_COLORS.get(str(annotation_color).strip().lower())
     if color is None:
         raise ApiClientError(f"Unsupported annotation color: {annotation_color!r}")
-    image_count = "THREE" if has_mask else "TWO"
-    mask_section = (
-        "\n  IMAGE 3 — BINARY SELECTION MASK: WHITE pixels are editable; "
-        "BLACK pixels must remain unchanged.\n"
-        "The binary mask is authoritative if the colored guide is ambiguous."
-        if has_mask
-        else ""
-    )
     system = f"""You are a precise, non-destructive image editor.
 
-You receive exactly {image_count} images:
+You receive exactly TWO images:
   IMAGE 1 — ORIGINAL: the image to edit.
-  IMAGE 2 — ANNOTATION GUIDE: a copy with translucent {color} marks.{mask_section}
+  IMAGE 2 — ANNOTATION GUIDE: a pixel-aligned copy with translucent {color} marks.
 
 Apply the user's requested changes only inside the selected regions.
-The final image must contain no annotation borders, tint, guide marks, or mask.
+The colored marks in IMAGE 2 define the complete editable region. Treat IMAGE 1
+as the source of truth for all unmarked content. The final image must contain no
+annotation borders, tint, or guide marks.
 Preserve every unselected pixel as closely as possible, including layout, text,
-colors, style, and composition. Return a complete natural image, not a mask or
+colors, style, and composition. Return a complete natural image, not a guide or
 an explanation-only response."""
     annotation_label = (
         f"IMAGE 2 — ANNOTATION GUIDE ({color} overlay = region to edit)."
     )
-    mask_label = (
-        "IMAGE 3 — BINARY SELECTION MASK (WHITE = edit; BLACK = preserve)."
-    )
-    return system, annotation_label, mask_label
+    return system, annotation_label
 
 
 def _mime_alias(value: str) -> str:
@@ -254,6 +246,138 @@ def _provider_input_image(data: bytes) -> ValidatedImage:
     if not decoded.save(buffer, "PNG"):
         raise ImageValidationError("Could not normalize input image as PNG")
     return validate_image_bytes(bytes(target), "image/png")
+
+
+def _decode_wire_image(image: ValidatedImage) -> QImage:
+    """Decode provider input with metadata orientation applied exactly once."""
+
+    device = QBuffer()
+    device.setData(QByteArray(image.data))
+    if not device.open(QIODevice.OpenModeFlag.ReadOnly):
+        raise ImageValidationError("Could not open provider input image")
+    reader = QImageReader(device)
+    reader.setDecideFormatFromContent(True)
+    reader.setAutoTransform(True)
+    decoded = reader.read()
+    if decoded.isNull():
+        raise ImageValidationError("Could not decode provider input image")
+    return decoded
+
+
+def _encode_wire_jpeg(
+    image: QImage,
+    width: int,
+    height: int,
+) -> ValidatedImage:
+    """Encode a detached JPEG wire copy without changing the caller's image."""
+
+    if width <= 0 or height <= 0:
+        raise ImageValidationError("Wire image dimensions are invalid")
+    scaled = image
+    if image.width() != width or image.height() != height:
+        scaled = image.scaled(
+            width,
+            height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if scaled.isNull():
+            raise ImageValidationError("Could not resize provider input image")
+
+    # JPEG has no alpha channel.  Composite both the original and its guide on
+    # the same white background so transparent pixels cannot acquire different
+    # RGB values and shift the apparent edit region.
+    flattened = QImage(width, height, QImage.Format.Format_RGB32)
+    if flattened.isNull():
+        raise ImageValidationError("Could not allocate provider input image")
+    flattened.fill(Qt.GlobalColor.white)
+    painter = QPainter(flattened)
+    try:
+        painter.drawImage(0, 0, scaled)
+    finally:
+        painter.end()
+
+    target = QByteArray()
+    buffer = QBuffer(target)
+    if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+        raise ImageValidationError("Could not encode provider input image")
+    if not flattened.save(buffer, "JPEG", _WIRE_JPEG_QUALITY):
+        raise ImageValidationError("Could not encode provider input image as JPEG")
+    return validate_image_bytes(bytes(target), "image/jpeg")
+
+
+def _fit_edit_wire_request(
+    original: ValidatedImage,
+    annotation: ValidatedImage,
+    request_factory: Callable[[ValidatedImage, ValidatedImage], ApiRequest],
+) -> ApiRequest:
+    """Return a two-image edit request bounded to the provider wire budget.
+
+    Both inputs are always encoded from their full-resolution decoded sources at
+    the same dimensions.  JPEG quality stays at 95; only when the complete JSON
+    request would exceed 16 MiB are both images scaled by the same factor.  The
+    local source bytes and the lossless annotation/mask retained by ``EditRequest``
+    are never modified.
+    """
+
+    original_image = _decode_wire_image(original)
+    annotation_image = _decode_wire_image(annotation)
+    if original_image.size() != annotation_image.size():
+        raise ImageValidationError(
+            "Annotation guide dimensions must match the oriented original image"
+        )
+
+    source_width = original_image.width()
+    source_height = original_image.height()
+    # JPEG encoders have a finite dimension range.  A longest-edge cap also
+    # avoids doing a doomed full-size encode for extremely panoramic inputs;
+    # the paired images still use one exact scale transform.
+    scale = min(1.0, _MAX_WIRE_EDGE / max(source_width, source_height))
+    previous_dimensions: tuple[int, int] | None = None
+
+    for _attempt in range(20):
+        width = max(1, round(source_width * scale))
+        height = max(1, round(source_height * scale))
+        dimensions = (width, height)
+        if dimensions == previous_dimensions:
+            # Rounding can otherwise keep a very thin edge unchanged forever.
+            if dimensions == (1, 1):
+                break
+            longest = max(width, height)
+            next_longest = max(1, longest - 1)
+            scale *= next_longest / longest
+            continue
+        previous_dimensions = dimensions
+        wire_original = _encode_wire_jpeg(
+            original_image,
+            width,
+            height,
+        )
+        wire_annotation = _encode_wire_jpeg(
+            annotation_image,
+            width,
+            height,
+        )
+        candidate = request_factory(wire_original, wire_annotation)
+        body_size = len(candidate.body)
+        if body_size <= _EDIT_BODY_TARGET_BYTES:
+            return candidate
+
+        if dimensions == (1, 1):
+            break
+        # Encoded JPEG size is approximately proportional to pixel count.  A
+        # small safety margin normally reaches the target in one resize while
+        # the 0.90 cap guarantees progress for prompt-heavy requests.
+        estimated = math.sqrt(_EDIT_BODY_TARGET_BYTES / body_size) * 0.96
+        next_scale = scale * min(0.90, max(0.01, estimated))
+        if next_scale >= scale:
+            next_scale = scale * 0.90
+        scale = next_scale
+
+    raise ApiClientError(
+        "Edit request exceeds the 16 MiB upload limit even at the smallest "
+        "usable wire dimensions"
+    )
 
 
 def validate_remote_image_url_syntax(url: str) -> tuple[str, int]:
@@ -460,24 +584,16 @@ class ApiClient:
         original = _provider_input_image(original_image)
         annotation = _provider_input_image(annotated_image)
         mask = validate_image_bytes(selection_mask) if selection_mask else None
-        original_size = (original.width, original.height)
         if annotation.fmt != "png":
             raise ImageValidationError("Annotation guide must be a lossless PNG")
-        if (annotation.width, annotation.height) != original_size:
-            raise ImageValidationError(
-                "Annotation guide dimensions must match the original image"
-            )
         if mask is not None:
             if mask.fmt != "png":
                 raise ImageValidationError("Selection mask must be a lossless PNG")
-            if (mask.width, mask.height) != original_size:
+            if (mask.width, mask.height) != (annotation.width, annotation.height):
                 raise ImageValidationError(
-                    "Selection mask dimensions must match the original image"
+                    "Selection mask dimensions must match the annotation guide"
                 )
-        system_prompt, annotation_label, mask_label = _edit_instruction(
-            annotation_color,
-            has_mask=mask is not None,
-        )
+        system_prompt, annotation_label = _edit_instruction(annotation_color)
         combined = (
             "[System instruction]\n"
             f"{system_prompt}\n\n"
@@ -496,98 +612,86 @@ class ApiClient:
             aspect_ratio=aspect_ratio,
             api_url=api_url,
         )
-        original_uri = (
-            f"data:{original.mime_type};base64,"
-            f"{base64.b64encode(original.data).decode('ascii')}"
-        )
-        annotation_uri = (
-            f"data:{annotation.mime_type};base64,"
-            f"{base64.b64encode(annotation.data).decode('ascii')}"
-        )
-        mask_uri = (
-            f"data:{mask.mime_type};base64,"
-            f"{base64.b64encode(mask.data).decode('ascii')}"
-            if mask is not None
-            else None
-        )
-        if selected is Provider.OPENROUTER:
-            payload = dict(request.payload)
-            if "messages" in payload:
-                content: list[dict[str, Any]] = [
-                    {"type": "text", "text": combined},
-                    {"type": "image_url", "image_url": {"url": original_uri}},
-                    {"type": "text", "text": annotation_label},
-                    {"type": "image_url", "image_url": {"url": annotation_uri}},
-                ]
-                if mask_uri is not None:
-                    content.extend(
-                        [
-                            {"type": "text", "text": mask_label},
-                            {"type": "image_url", "image_url": {"url": mask_uri}},
-                        ]
-                    )
-                payload["messages"] = [
-                    {
-                        "role": "user",
-                        "content": content,
-                    }
-                ]
-            else:
-                # The dedicated Images API accepts ordered reference images
-                # separately from the prompt.  Spell out the order so the same
-                # original/annotation semantics survive the protocol switch.
-                payload["prompt"] = (
-                    f"{combined}\n\n"
-                    "[Reference mapping]\n"
-                    "IMAGE 1 — ORIGINAL.\n"
-                    f"{annotation_label}"
-                    + (f"\n{mask_label}" if mask_uri is not None else "")
-                )
-                payload["input_references"] = [
-                    {"type": "image_url", "image_url": {"url": original_uri}},
-                    {"type": "image_url", "image_url": {"url": annotation_uri}},
-                ]
-                if mask_uri is not None:
-                    payload["input_references"].append(
-                        {"type": "image_url", "image_url": {"url": mask_uri}}
-                    )
-        else:
-            payload = dict(request.payload)
-            parts: list[dict[str, Any]] = [
-                {"text": combined},
-                {
-                    "inlineData": {
-                        "mimeType": original.mime_type,
-                        "data": base64.b64encode(original.data).decode("ascii"),
-                    }
-                },
-                {"text": annotation_label},
-                {
-                    "inlineData": {
-                        "mimeType": annotation.mime_type,
-                        "data": base64.b64encode(annotation.data).decode("ascii"),
-                    }
-                },
-            ]
-            if mask is not None:
-                parts.extend(
-                    [
-                        {"text": mask_label},
+        def build_wire_request(
+            wire_original: ValidatedImage,
+            wire_annotation: ValidatedImage,
+        ) -> ApiRequest:
+            original_uri = (
+                f"data:{wire_original.mime_type};base64,"
+                f"{base64.b64encode(wire_original.data).decode('ascii')}"
+            )
+            annotation_uri = (
+                f"data:{wire_annotation.mime_type};base64,"
+                f"{base64.b64encode(wire_annotation.data).decode('ascii')}"
+            )
+
+            if selected is Provider.OPENROUTER:
+                payload = dict(request.payload)
+                if "messages" in payload:
+                    payload["messages"] = [
                         {
-                            "inlineData": {
-                                "mimeType": mask.mime_type,
-                                "data": base64.b64encode(mask.data).decode("ascii"),
-                            }
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": combined},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": original_uri},
+                                },
+                                {"type": "text", "text": annotation_label},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": annotation_uri},
+                                },
+                            ],
+                        }
+                    ]
+                else:
+                    # Images API keeps the same ordered, two-image contract as
+                    # Chat Completions.  The local mask has already defined the
+                    # colored guide and is intentionally not a third reference.
+                    payload["prompt"] = (
+                        f"{combined}\n\n"
+                        "[Reference mapping]\n"
+                        "IMAGE 1 — ORIGINAL.\n"
+                        f"{annotation_label}"
+                    )
+                    payload["input_references"] = [
+                        {"type": "image_url", "image_url": {"url": original_uri}},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": annotation_uri},
                         },
                     ]
-                )
-            payload["contents"] = [
-                {
-                    "role": "user",
-                    "parts": parts,
-                }
-            ]
-        return ApiRequest(request.provider, request.url, request.headers, payload)
+            else:
+                payload = dict(request.payload)
+                payload["contents"] = [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": combined},
+                            {
+                                "inlineData": {
+                                    "mimeType": wire_original.mime_type,
+                                    "data": base64.b64encode(
+                                        wire_original.data
+                                    ).decode("ascii"),
+                                }
+                            },
+                            {"text": annotation_label},
+                            {
+                                "inlineData": {
+                                    "mimeType": wire_annotation.mime_type,
+                                    "data": base64.b64encode(
+                                        wire_annotation.data
+                                    ).decode("ascii"),
+                                }
+                            },
+                        ],
+                    }
+                ]
+            return ApiRequest(request.provider, request.url, request.headers, payload)
+
+        return _fit_edit_wire_request(original, annotation, build_wire_request)
 
     @staticmethod
     def _openrouter_images_url(api_url: str) -> str:
