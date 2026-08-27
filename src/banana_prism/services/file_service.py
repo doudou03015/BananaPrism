@@ -19,6 +19,7 @@ from PySide6.QtGui import QImageReader
 
 from banana_prism import __version__
 from banana_prism.constants import (
+    ANNOTATION_COLORS,
     API_PROVIDERS,
     MAX_FILENAME_LENGTH,
 )
@@ -298,6 +299,17 @@ class FileService:
             raise FileSaveError("result dimensions do not match encoded image bytes")
         digest = hashlib.sha256(result.image_bytes).hexdigest()
         dpi = self._actual_dpi(result, decoded_dpi)
+        requested_output_format = str(request.requested_output_format).strip().lower()
+        if requested_output_format not in {"png", "jpeg"}:
+            raise FileSaveError("requested output format is unsupported")
+        requested_dpi = request.requested_dpi
+        if (
+            isinstance(requested_dpi, bool)
+            or not isinstance(requested_dpi, (int, float))
+            or not math.isfinite(float(requested_dpi))
+            or float(requested_dpi) not in {72.0, 96.0, 150.0, 300.0}
+        ):
+            raise FileSaveError("requested output DPI is unsupported")
         common: dict[str, Any] = {
             "schema_version": 1,
             "app_version": __version__,
@@ -310,6 +322,10 @@ class FileService:
             "preset_id": request.preset_id,
             "text_content": redact_for_display(result.text_content),
             "saved_fmt": _normalise_format(result.fmt),
+            "requested_output_format": requested_output_format,
+            "requested_dpi": float(requested_dpi),
+            "actual_output_format": detected_fmt,
+            "actual_dpi": list(dpi) if dpi is not None else None,
             "width": result.width,
             "height": result.height,
             "timestamp": result.timestamp.isoformat(),
@@ -321,7 +337,14 @@ class FileService:
             common["prompt"] = redact_for_display(request.prompt)
             common["fmt"] = _normalise_format(result.fmt)
         else:
+            annotation_color = str(request.annotation_color).strip().lower()
+            if annotation_color not in ANNOTATION_COLORS:
+                raise FileSaveError("annotation color is unsupported")
             common["edit_prompt"] = redact_for_display(request.edit_prompt)
+            common["annotation_color"] = annotation_color
+            common["selection_mask_format"] = (
+                "png" if request.selection_mask_bytes else None
+            )
             common["source_fmt"] = _normalise_format(request.source_fmt)
             common["wire_source_fmt"] = (
                 _normalise_format(request.wire_source_fmt)

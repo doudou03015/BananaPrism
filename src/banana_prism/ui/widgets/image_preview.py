@@ -35,8 +35,8 @@ from PySide6.QtWidgets import (
 )
 
 from banana_prism.constants import (
-    ANNOTATION_BORDER_COLOR,
-    ANNOTATION_COLOR,
+    ANNOTATION_COLORS,
+    DEFAULT_ANNOTATION_COLOR,
     DEFAULT_BRUSH_RADIUS,
     MAX_UNDO_COMMANDS,
     ZOOM_MAX,
@@ -47,6 +47,7 @@ from banana_prism.i18n import tr
 
 EditTool = Literal["view", "rect", "brush", "eraser"]
 _TILE_SIZE = 128
+_ALPHA_TO_BINARY = bytes(0 if value == 0 else 255 for value in range(256))
 
 
 @dataclass(slots=True)
@@ -80,8 +81,16 @@ class _ImageCanvas(QWidget):
         self._rect_start: QPointF | None = None
         self._rect_current: QPointF | None = None
         self._drawing = False
+        self._panning = False
+        self._pan_start_global = QPointF()
+        self._pan_start_scroll = (0, 0)
+        self._scroll_area: QScrollArea | None = None
         self._tool: EditTool = "view"
         self._brush_radius = DEFAULT_BRUSH_RADIUS
+        self._annotation_color_id = DEFAULT_ANNOTATION_COLOR
+        color = ANNOTATION_COLORS[self._annotation_color_id]
+        self._annotation_color = color.fill_rgba
+        self._annotation_border_color = color.border_rgba
         self._zoom = 1.0
         self.setMinimumSize(1, 1)
 
@@ -110,19 +119,61 @@ class _ImageCanvas(QWidget):
         if tool not in {"view", "rect", "brush", "eraser"}:
             raise ValueError(f"unknown edit tool: {tool}")
         self._tool = tool
-        cursor = {
-            "view": Qt.CursorShape.ArrowCursor,
-            "rect": Qt.CursorShape.CrossCursor,
-            "brush": Qt.CursorShape.BlankCursor,
-            "eraser": Qt.CursorShape.BlankCursor,
-        }[tool]
-        self.setCursor(cursor)
         self._cancel_gesture()
+        self._update_cursor()
         self.update()
+
+    def set_scroll_area(self, scroll_area: QScrollArea) -> None:
+        """Bind the viewport whose scroll bars are controlled by view-mode drag."""
+
+        self._scroll_area = scroll_area
+        scroll_area.horizontalScrollBar().rangeChanged.connect(self._update_cursor)
+        scroll_area.verticalScrollBar().rangeChanged.connect(self._update_cursor)
+        self._update_cursor()
+
+    def _can_pan(self) -> bool:
+        if self._image.isNull() or self._scroll_area is None:
+            return False
+        horizontal = self._scroll_area.horizontalScrollBar()
+        vertical = self._scroll_area.verticalScrollBar()
+        return horizontal.maximum() > horizontal.minimum() or vertical.maximum() > vertical.minimum()
+
+    def _update_cursor(self, *_range: int) -> None:
+        if self._tool == "view":
+            if self._panning:
+                cursor = Qt.CursorShape.ClosedHandCursor
+            elif self._can_pan():
+                cursor = Qt.CursorShape.OpenHandCursor
+            else:
+                cursor = Qt.CursorShape.ArrowCursor
+        else:
+            cursor = {
+                "rect": Qt.CursorShape.CrossCursor,
+                "brush": Qt.CursorShape.BlankCursor,
+                "eraser": Qt.CursorShape.BlankCursor,
+            }[self._tool]
+        self.setCursor(cursor)
 
     def set_brush_radius(self, radius: int) -> None:
         self._brush_radius = max(1, int(radius))
         self.update()
+
+    def set_annotation_color(self, color_id: str) -> None:
+        """Select the guide colour used on screen and in the exported guide."""
+
+        normalized = str(color_id).strip().lower()
+        try:
+            color = ANNOTATION_COLORS[normalized]
+        except KeyError as exc:
+            raise ValueError(f"unknown annotation colour: {color_id}") from exc
+        self._annotation_color_id = normalized
+        self._annotation_color = color.fill_rgba
+        self._annotation_border_color = color.border_rgba
+        self.update()
+
+    @property
+    def annotation_color(self) -> str:
+        return self._annotation_color_id
 
     def set_zoom(self, zoom: float) -> None:
         zoom = max(float(ZOOM_MIN), min(float(ZOOM_MAX), float(zoom)))
@@ -182,7 +233,7 @@ class _ImageCanvas(QWidget):
         result = self._image.convertToFormat(QImage.Format.Format_ARGB32)
         painter = QPainter(result)
         if self._mask_has_pixels:
-            red, green, blue, alpha = ANNOTATION_COLOR
+            red, green, blue, alpha = self._annotation_color
             overlay = QImage(self._image.size(), QImage.Format.Format_ARGB32_Premultiplied)
             overlay.fill(QColor(red, green, blue, 255))
             overlay.setAlphaChannel(self._mask)
@@ -191,6 +242,22 @@ class _ImageCanvas(QWidget):
             painter.setOpacity(1.0)
         painter.end()
         return result
+
+    def selection_mask_image(self) -> QImage:
+        """Return the authoritative full-resolution black/white selection mask."""
+
+        if self._mask.isNull() or not self.has_selection():
+            return QImage()
+        # Alpha8 and Grayscale8 are both one byte per pixel.  Reinterpret a
+        # thresholded copy so antialiased edge pixels are unambiguously selected.
+        raw = bytes(self._mask.constBits()).translate(_ALPHA_TO_BINARY)
+        return QImage(
+            raw,
+            self._mask.width(),
+            self._mask.height(),
+            self._mask.bytesPerLine(),
+            QImage.Format.Format_Grayscale8,
+        ).copy()
 
     def _to_image_point(self, widget_point: QPointF) -> QPointF:
         if self._image.isNull():
@@ -309,14 +376,28 @@ class _ImageCanvas(QWidget):
 
     def _cancel_gesture(self) -> None:
         self._drawing = False
+        self._panning = False
         self._stroke_tiles.clear()
         self._stroke_last = None
         self._rect_start = None
         self._rect_current = None
+        self._update_cursor()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self._image.isNull() or event.button() != Qt.MouseButton.LeftButton or self._tool == "view":
+        if self._image.isNull() or event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
+            return
+        if self._tool == "view":
+            if not self._can_pan() or self._scroll_area is None:
+                super().mousePressEvent(event)
+                return
+            horizontal = self._scroll_area.horizontalScrollBar()
+            vertical = self._scroll_area.verticalScrollBar()
+            self._panning = True
+            self._pan_start_global = event.globalPosition()
+            self._pan_start_scroll = (horizontal.value(), vertical.value())
+            self._update_cursor()
+            event.accept()
             return
         self._drawing = True
         point = self._to_image_point(event.position())
@@ -330,6 +411,14 @@ class _ImageCanvas(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._panning and self._scroll_area is not None:
+            delta = event.globalPosition() - self._pan_start_global
+            horizontal = self._scroll_area.horizontalScrollBar()
+            vertical = self._scroll_area.verticalScrollBar()
+            horizontal.setValue(self._pan_start_scroll[0] - int(round(delta.x())))
+            vertical.setValue(self._pan_start_scroll[1] - int(round(delta.y())))
+            event.accept()
+            return
         if not self._image.isNull() and self._tool in {"brush", "eraser"}:
             self.update()
         if not self._drawing:
@@ -343,6 +432,11 @@ class _ImageCanvas(QWidget):
         self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._panning and event.button() == Qt.MouseButton.LeftButton:
+            self._panning = False
+            self._update_cursor()
+            event.accept()
+            return
         if not self._drawing or event.button() != Qt.MouseButton.LeftButton:
             super().mouseReleaseEvent(event)
             return
@@ -375,14 +469,14 @@ class _ImageCanvas(QWidget):
         painter.scale(self._zoom, self._zoom)
         painter.drawImage(0, 0, self._image)
         if self._mask_has_pixels or self._drawing:
-            red, green, blue, alpha = ANNOTATION_COLOR
+            red, green, blue, alpha = self._annotation_color
             overlay = QImage(self._image.size(), QImage.Format.Format_ARGB32_Premultiplied)
             overlay.fill(QColor(red, green, blue, 255))
             overlay.setAlphaChannel(self._mask)
             painter.setOpacity(alpha / 255.0)
             painter.drawImage(0, 0, overlay)
             painter.setOpacity(1.0)
-        red, green, blue, alpha = ANNOTATION_BORDER_COLOR
+        red, green, blue, alpha = self._annotation_border_color
         painter.setPen(QPen(QColor(red, green, blue, alpha), max(1.0, 3.0 / self._zoom)))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         if self._drawing and self._rect_start is not None and self._rect_current is not None:
@@ -391,7 +485,11 @@ class _ImageCanvas(QWidget):
         if self._tool in {"brush", "eraser"} and self.underMouse():
             cursor = self.mapFromGlobal(self.cursor().pos())
             radius = self._brush_radius * self._zoom
-            color = QColor(*ANNOTATION_BORDER_COLOR) if self._tool == "brush" else QColor("#f7fafc")
+            color = (
+                QColor(*self._annotation_border_color)
+                if self._tool == "brush"
+                else QColor("#f7fafc")
+            )
             painter.setPen(QPen(color, 1.5))
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawEllipse(QPointF(cursor), radius, radius)
@@ -423,6 +521,7 @@ class ImagePreview(QFrame):
         self._scroll.setWidgetResizable(False)
         self._scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._canvas.set_scroll_area(self._scroll)
 
         self._zoom_label = QLabel(tr("preview.zoom.initial"))
         self._zoom_label.setMinimumWidth(48)
@@ -516,6 +615,13 @@ class ImagePreview(QFrame):
     def set_brush_radius(self, radius: int) -> None:
         self._canvas.set_brush_radius(radius)
 
+    def set_annotation_color(self, color_id: str) -> None:
+        self._canvas.set_annotation_color(color_id)
+
+    @property
+    def annotation_color(self) -> str:
+        return self._canvas.annotation_color
+
     def has_selection(self) -> bool:
         return self._canvas.has_selection()
 
@@ -530,6 +636,21 @@ class ImagePreview(QFrame):
 
     def get_annotated_bytes(self) -> bytes | None:
         image = self.get_annotated_qimage()
+        if image.isNull():
+            return None
+        data = QByteArray()
+        buffer = QBuffer(data)
+        if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+            return None
+        ok = image.save(buffer, "PNG")
+        buffer.close()
+        return bytes(data) if ok else None
+
+    def get_selection_mask_qimage(self) -> QImage:
+        return self._canvas.selection_mask_image()
+
+    def get_selection_mask_bytes(self) -> bytes | None:
+        image = self.get_selection_mask_qimage()
         if image.isNull():
             return None
         data = QByteArray()

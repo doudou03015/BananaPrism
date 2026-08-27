@@ -64,12 +64,14 @@ from PySide6.QtWidgets import (
 )
 
 from banana_prism.constants import (
+    ANNOTATION_COLORS,
     API_PROVIDERS,
     DEFAULT_BRUSH_RADIUS,
+    DEFAULT_ANNOTATION_COLOR,
     DEFAULT_RATIO,
     MODELS,
-    OUTPUT_DPI,
     RATIOS,
+    SIZE_DIMENSIONS,
     SIZES,
 )
 from banana_prism import __version__
@@ -92,6 +94,10 @@ from banana_prism.ui.widgets.image_preview import ImagePreview
 from banana_prism.ui.widgets.log_panel import LogPanel
 from banana_prism.ui.widgets.text_result_panel import TextResultPanel
 from banana_prism.utils.helpers import detect_image_format
+
+
+_OUTPUT_FORMATS = (("PNG", "png"), ("JPEG", "jpeg"))
+_OUTPUT_DPIS = (72, 96, 150, 300)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +169,7 @@ class MainWindow(QMainWindow):
         self._close_when_idle = False
         self._close_confirmed = False
         self._console_runtime_presets: tuple[ApiPreset, ...] | None = None
+        self._progress_stage_connected = False
 
         self._build_actions()
         self._build_ui()
@@ -352,7 +359,7 @@ class MainWindow(QMainWindow):
         self._size_combo = QComboBox()
         self._size_combo.setObjectName("sizeCombo")
         self._size_combo.addItems(SIZES)
-        self._size_combo.currentIndexChanged.connect(self._persist_parameter_choices)
+        self._size_combo.currentIndexChanged.connect(self._on_output_geometry_changed)
         layout.addWidget(QLabel(tr("main.field.api_preset")))
         layout.addWidget(self._preset_combo)
         layout.addWidget(QLabel(tr("main.field.model")))
@@ -371,8 +378,37 @@ class MainWindow(QMainWindow):
             button.setObjectName(f"ratio_{ratio.replace(':', '_')}")
             self._ratio_group.addButton(button)
             ratio_grid.addWidget(button, index // 3, index % 3)
-        self._ratio_group.buttonClicked.connect(self._persist_parameter_choices)
+        self._ratio_group.buttonClicked.connect(self._on_output_geometry_changed)
         layout.addLayout(ratio_grid)
+        self._pixel_dimensions_label = QLabel()
+        self._pixel_dimensions_label.setObjectName("estimatedPixelDimensions")
+        self._pixel_dimensions_label.setProperty("hint", True)
+        self._pixel_dimensions_label.setToolTip(
+            tr("main.parameters.estimated_pixels_tooltip")
+        )
+        layout.addWidget(self._pixel_dimensions_label)
+
+        export_grid = QGridLayout()
+        export_grid.setSpacing(5)
+        export_grid.addWidget(QLabel(tr("main.field.output_format")), 0, 0)
+        export_grid.addWidget(QLabel(tr("main.field.output_dpi")), 0, 1)
+        self._output_format_combo = QComboBox()
+        self._output_format_combo.setObjectName("outputFormatCombo")
+        for label, value in _OUTPUT_FORMATS:
+            self._output_format_combo.addItem(label, value)
+        self._output_format_combo.currentIndexChanged.connect(
+            self._persist_parameter_choices
+        )
+        self._output_dpi_combo = QComboBox()
+        self._output_dpi_combo.setObjectName("outputDpiCombo")
+        for value in _OUTPUT_DPIS:
+            self._output_dpi_combo.addItem(f"{value} DPI", value)
+        self._output_dpi_combo.currentIndexChanged.connect(
+            self._persist_parameter_choices
+        )
+        export_grid.addWidget(self._output_format_combo, 1, 0)
+        export_grid.addWidget(self._output_dpi_combo, 1, 1)
+        layout.addLayout(export_grid)
         hint = QLabel(tr("main.parameters.note"))
         hint.setWordWrap(True)
         hint.setProperty("hint", True)
@@ -470,10 +506,21 @@ class MainWindow(QMainWindow):
         brush_row.addWidget(self._brush_slider, 1)
         brush_row.addWidget(self._brush_radius_label)
         layout.addLayout(brush_row)
-        guide = QLabel(tr("main.annotation.note"))
-        guide.setWordWrap(True)
-        guide.setProperty("hint", True)
-        layout.addWidget(guide)
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel(tr("main.field.annotation_color")))
+        self._annotation_color_combo = QComboBox()
+        self._annotation_color_combo.setObjectName("annotationColorCombo")
+        for color_id, spec in ANNOTATION_COLORS.items():
+            self._annotation_color_combo.addItem(tr(spec.label_key), color_id)
+        self._annotation_color_combo.currentIndexChanged.connect(
+            self._on_annotation_color_changed
+        )
+        color_row.addWidget(self._annotation_color_combo, 1)
+        layout.addLayout(color_row)
+        self._annotation_guide = QLabel()
+        self._annotation_guide.setWordWrap(True)
+        self._annotation_guide.setProperty("hint", True)
+        layout.addWidget(self._annotation_guide)
         self._edit_prompt = QPlainTextEdit()
         self._edit_prompt.setObjectName("editPrompt")
         self._edit_prompt.setPlaceholderText(tr("main.edit.placeholder"))
@@ -592,28 +639,160 @@ class MainWindow(QMainWindow):
             self._log("warn", tr("main.settings.save_failed", error=user_error_text(exc)))
         return False
 
+    def _write_settings(self, values: dict[str, Any]) -> bool:
+        """Atomically persist a preference group when the service supports it."""
+
+        service = self._settings_service
+        if service is None:
+            return False
+        setter = getattr(service, "set_many", None)
+        if callable(setter):
+            try:
+                setter(values)
+                return True
+            except (TypeError, ValueError, RuntimeError, OSError) as exc:
+                self._log(
+                    "warn",
+                    tr("main.settings.save_failed", error=user_error_text(exc)),
+                )
+                return False
+        return all(self._write_setting(key, value) for key, value in values.items())
+
     def _load_preferences(self) -> None:
         model_index = int(self._setting("last_model_index", 0) or 0)
         size_index = int(self._setting("last_size_index", 0) or 0)
         ratio = str(self._setting("last_ratio", DEFAULT_RATIO) or DEFAULT_RATIO)
-        self._model_combo.setCurrentIndex(max(0, min(len(MODELS) - 1, model_index)))
+        output_format = str(
+            self._setting("last_output_format", "png") or "png"
+        ).lower()
+        try:
+            output_dpi = int(self._setting("last_output_dpi", 300) or 300)
+        except (TypeError, ValueError):
+            output_dpi = 300
+        annotation_color = str(
+            self._setting("last_annotation_color", DEFAULT_ANNOTATION_COLOR)
+            or DEFAULT_ANNOTATION_COLOR
+        ).lower()
+        if output_format not in {value for _label, value in _OUTPUT_FORMATS}:
+            output_format = "png"
+        if output_dpi not in _OUTPUT_DPIS:
+            output_dpi = 300
+        if annotation_color not in ANNOTATION_COLORS:
+            annotation_color = DEFAULT_ANNOTATION_COLOR
+        self._output_format_combo.blockSignals(True)
+        self._output_dpi_combo.blockSignals(True)
+        try:
+            self._output_format_combo.setCurrentIndex(
+                max(0, self._output_format_combo.findData(output_format))
+            )
+            self._output_dpi_combo.setCurrentIndex(
+                max(0, self._output_dpi_combo.findData(output_dpi))
+            )
+        finally:
+            self._output_format_combo.blockSignals(False)
+            self._output_dpi_combo.blockSignals(False)
+        self._annotation_color_combo.blockSignals(True)
+        try:
+            self._annotation_color_combo.setCurrentIndex(
+                max(0, self._annotation_color_combo.findData(annotation_color))
+            )
+        finally:
+            self._annotation_color_combo.blockSignals(False)
+        self._preview.set_annotation_color(annotation_color)
+        self._update_annotation_guide()
+        self._model_combo.blockSignals(True)
+        try:
+            self._model_combo.setCurrentIndex(
+                max(0, min(len(MODELS) - 1, model_index))
+            )
+        finally:
+            self._model_combo.blockSignals(False)
         preferred_size = SIZES[max(0, min(len(SIZES) - 1, size_index))]
         self._refresh_supported_sizes(preferred_size)
         button = next((item for item in self._ratio_group.buttons() if item.text() == ratio), None)
         (button or self._ratio_group.buttons()[0]).setChecked(True)
+        self._update_estimated_pixel_dimensions()
 
     def _persist_parameter_choices(self, *_args: Any) -> None:
         if not hasattr(self, "_model_combo"):
             return
-        self._write_setting("last_model_index", self._model_combo.currentIndex())
         current_size = self._size_combo.currentText()
         size_index = SIZES.index(current_size) if current_size in SIZES else 0
-        self._write_setting("last_size_index", size_index)
-        self._write_setting("last_ratio", self._selected_ratio())
+        values: dict[str, Any] = {
+            "last_model_index": self._model_combo.currentIndex(),
+            "last_size_index": size_index,
+            "last_ratio": self._selected_ratio(),
+            "last_output_format": self._selected_output_format(),
+            "last_output_dpi": self._selected_output_dpi(),
+        }
+        if hasattr(self, "_annotation_color_combo"):
+            values["last_annotation_color"] = self._selected_annotation_color()
+        self._write_settings(values)
+
+    def _on_output_geometry_changed(self, *_args: Any) -> None:
+        self._persist_parameter_choices()
+        self._update_estimated_pixel_dimensions()
+
+    def _selected_output_format(self) -> str:
+        value = str(self._output_format_combo.currentData() or "png").lower()
+        return value if value in {item[1] for item in _OUTPUT_FORMATS} else "png"
+
+    def _selected_output_dpi(self) -> float:
+        try:
+            value = int(self._output_dpi_combo.currentData())
+        except (TypeError, ValueError):
+            value = 300
+        return float(value if value in _OUTPUT_DPIS else 300)
+
+    def _selected_annotation_color(self) -> str:
+        value = str(
+            self._annotation_color_combo.currentData() or DEFAULT_ANNOTATION_COLOR
+        ).lower()
+        return value if value in ANNOTATION_COLORS else DEFAULT_ANNOTATION_COLOR
+
+    def _on_annotation_color_changed(self, *_args: Any) -> None:
+        color_id = self._selected_annotation_color()
+        if hasattr(self, "_preview"):
+            self._preview.set_annotation_color(color_id)
+            if self._preview.has_selection():
+                self._preview.set_status(
+                    tr(
+                        "main.annotation.ready",
+                        color=tr(ANNOTATION_COLORS[color_id].label_key),
+                    )
+                )
+        self._write_setting("last_annotation_color", color_id)
+        self._update_annotation_guide()
+
+    def _update_annotation_guide(self) -> None:
+        if not hasattr(self, "_annotation_guide"):
+            return
+        spec = ANNOTATION_COLORS[self._selected_annotation_color()]
+        self._annotation_guide.setText(
+            tr("main.annotation.note", color=tr(spec.label_key))
+        )
+
+    def _update_estimated_pixel_dimensions(self) -> None:
+        dimensions = SIZE_DIMENSIONS.get(self._size_combo.currentText(), {}).get(
+            self._selected_ratio()
+        )
+        if dimensions is None:
+            self._pixel_dimensions_label.setText(
+                tr("main.parameters.estimated_pixels_model")
+            )
+            return
+        self._pixel_dimensions_label.setText(
+            tr(
+                "main.parameters.estimated_pixels",
+                width=dimensions[0],
+                height=dimensions[1],
+            )
+        )
 
     def _on_model_changed(self, *_args: Any) -> None:
         self._refresh_supported_sizes(self._size_combo.currentText())
         self._persist_parameter_choices()
+        self._update_estimated_pixel_dimensions()
 
     def _refresh_supported_sizes(self, preferred_size: str | None = None) -> None:
         """Expose only output sizes supported by the selected model."""
@@ -731,6 +910,7 @@ class MainWindow(QMainWindow):
             "text_only": self._on_service_text_only,
             "cancelled": self._on_service_cancelled,
             "progress": self._on_service_progress,
+            "progress_stage": self._on_service_progress_stage,
             "log": self._on_service_log,
         }
         connected: set[int] = set()
@@ -741,6 +921,8 @@ class MainWindow(QMainWindow):
             try:
                 signal.connect(slot)
                 connected.add(id(signal))
+                if name == "progress_stage":
+                    self._progress_stage_connected = True
             except (TypeError, RuntimeError):
                 pass
 
@@ -785,6 +967,8 @@ class MainWindow(QMainWindow):
             "edit_prompt": request.edit_prompt,
             "original_image": request.source_image_bytes,
             "annotated_image": request.annotated_image_bytes,
+            "selection_mask": request.selection_mask_bytes,
+            "annotation_color": request.annotation_color,
             "image_size": request.size,
             "aspect_ratio": request.ratio,
             "api_url": context.preset.api_url,
@@ -858,6 +1042,8 @@ class MainWindow(QMainWindow):
             ratio=self._selected_ratio(),
             preset_id=preset.preset_id,
             provider=preset.provider,
+            requested_output_format=self._selected_output_format(),
+            requested_dpi=self._selected_output_dpi(),
         )
 
     def _confirm_request(
@@ -867,6 +1053,7 @@ class MainWindow(QMainWindow):
         *,
         source: QImage | None = None,
         guide: bytes | None = None,
+        mask: bytes | None = None,
     ) -> bool:
         dialog = PreflightDialog(
             request,
@@ -874,6 +1061,7 @@ class MainWindow(QMainWindow):
             preset_name=preset.name,
             source_image=source,
             annotated_image=guide,
+            selection_mask=mask,
         )
         return dialog.exec() == PreflightDialog.DialogCode.Accepted
 
@@ -946,6 +1134,14 @@ class MainWindow(QMainWindow):
                 tr("main.error.annotation.body"),
             )
             return False
+        selection_mask = self._preview.get_selection_mask_bytes()
+        if not selection_mask or not selection_mask.startswith(b"\x89PNG\r\n\x1a\n"):
+            QMessageBox.warning(
+                self,
+                tr("main.error.selection_mask.title"),
+                tr("main.error.selection_mask.body"),
+            )
+            return False
         model = self._current_model()
         detected_source_fmt = detect_image_format(self._work_bytes)
         wire_source_fmt = "png" if detected_source_fmt == "bmp" else detected_source_fmt
@@ -962,12 +1158,17 @@ class MainWindow(QMainWindow):
             source_fmt=self._work_fmt,
             source_dpi=self._work_source_dpi,
             wire_source_fmt=wire_source_fmt,
+            selection_mask_bytes=selection_mask,
+            annotation_color=self._selected_annotation_color(),
+            requested_output_format=self._selected_output_format(),
+            requested_dpi=self._selected_output_dpi(),
         )
         if not self._confirm_request(
             request,
             preset,
             source=self._preview.image(),
             guide=annotated,
+            mask=selection_mask,
         ):
             return False
         return self._start_context(_JobContext("edit", request, preset))
@@ -1060,18 +1261,23 @@ class MainWindow(QMainWindow):
         if isinstance(payload, (GenerationResult, EditResult)):
             payload.text_content = redact_for_display(payload.text_content)
             if context.kind == "generation" and isinstance(payload, GenerationResult):
+                request = context.request
+                assert isinstance(request, GenerationRequest)
+                payload.request = request
                 return self._apply_output_encoding(
                     payload,
-                    dpi=OUTPUT_DPI,
-                    target_fmt=payload.fmt,
+                    dpi=request.requested_dpi,
+                    target_fmt=request.requested_output_format,
+                    jpeg_quality=95,
                 )
             if context.kind == "edit" and isinstance(payload, EditResult):
                 request = context.request
                 assert isinstance(request, EditRequest)
+                payload.request = request
                 return self._apply_output_encoding(
                     payload,
-                    dpi=OUTPUT_DPI,
-                    target_fmt=request.source_fmt,
+                    dpi=request.requested_dpi,
+                    target_fmt=request.requested_output_format,
                     jpeg_quality=95,
                 )
             raise ValueError(tr("main.result.type_mismatch"))
@@ -1104,8 +1310,9 @@ class MainWindow(QMainWindow):
             )
             return self._apply_output_encoding(
                 result,
-                dpi=OUTPUT_DPI,
-                target_fmt=str(fmt),
+                dpi=request.requested_dpi,
+                target_fmt=request.requested_output_format,
+                jpeg_quality=95,
             )
         request = context.request
         assert isinstance(request, EditRequest)
@@ -1115,8 +1322,8 @@ class MainWindow(QMainWindow):
         )
         return self._apply_output_encoding(
             result,
-            dpi=OUTPUT_DPI,
-            target_fmt=request.source_fmt,
+            dpi=request.requested_dpi,
+            target_fmt=request.requested_output_format,
             jpeg_quality=95,
         )
 
@@ -1128,7 +1335,7 @@ class MainWindow(QMainWindow):
         target_fmt: str,
         jpeg_quality: int = -1,
     ) -> GenerationResult | EditResult:
-        """Embed DPI and, for edits, restore the source container format.
+        """Encode the chosen local container and embed the requested DPI metadata.
 
         A failed encoder never invalidates an otherwise valid provider image and
         never leaves metadata claiming that DPI was written.
@@ -1272,6 +1479,10 @@ class MainWindow(QMainWindow):
         self._finish_context("cancelled", message=tr("main.request.cancelled"))
 
     def _on_service_progress(self, *args: Any) -> None:
+        # Modern ImageService emits a richer stage signal immediately before
+        # this compatibility signal.  Let that message remain visible.
+        if self._progress_stage_connected:
+            return
         if len(args) >= 3:
             job_id, received, total = args[0], int(args[1]), int(args[2])
             if not self._job_matches(str(job_id)):
@@ -1285,6 +1496,36 @@ class MainWindow(QMainWindow):
         else:
             return
         self._preview.set_status(tr("main.progress.processing", progress=text))
+        self._job_status_label.setText(text)
+
+    def _on_service_progress_stage(self, *args: Any) -> None:
+        if len(args) < 4:
+            return
+        job_id, stage, current, total = (
+            str(args[0]),
+            str(args[1]).strip().lower(),
+            int(args[2]),
+            int(args[3]),
+        )
+        if not self._job_matches(job_id):
+            return
+        if stage == "generating":
+            text = tr("main.progress.stage.generating")
+        elif stage in {"uploading", "downloading"}:
+            direction = "upload" if stage == "uploading" else "download"
+            if total > 0:
+                text = tr(
+                    f"main.progress.stage.{direction}_percent",
+                    percent=max(0.0, min(100.0, current / total * 100.0)),
+                )
+            else:
+                text = tr(
+                    f"main.progress.stage.{direction}_kib",
+                    kib=max(0, current) / 1024,
+                )
+        else:
+            return
+        self._preview.set_status(text)
         self._job_status_label.setText(text)
 
     def _on_service_log(self, *args: Any) -> None:
@@ -1371,6 +1612,8 @@ class MainWindow(QMainWindow):
             model_index=self._model_combo.currentIndex(),
             size_index=SIZES.index(self._size_combo.currentText()),
             ratio=self._selected_ratio(),
+            output_format=self._selected_output_format(),
+            output_dpi=self._selected_output_dpi(),
         )
         self._queue.append(task)
         self._queue_presets[id(task)] = preset
@@ -1432,6 +1675,8 @@ class MainWindow(QMainWindow):
             ratio=task.ratio,
             preset_id=preset.preset_id,
             provider=preset.provider,
+            requested_output_format=task.output_format,
+            requested_dpi=task.output_dpi,
         )
         context = _JobContext("generation", request, preset, queue_task=task)
         task.status = QueueStatus.RUNNING
@@ -1789,7 +2034,10 @@ class MainWindow(QMainWindow):
 
     def _on_selection_changed(self, selected: bool) -> None:
         if selected:
-            self._preview.set_status(tr("main.annotation.ready"))
+            color = ANNOTATION_COLORS[self._selected_annotation_color()]
+            self._preview.set_status(
+                tr("main.annotation.ready", color=tr(color.label_key))
+            )
 
     def _preview_clear_selection(self) -> None:
         self._preview.clear_selection()

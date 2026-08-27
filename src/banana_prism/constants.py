@@ -28,6 +28,16 @@ class ModelSpec:
     supported_sizes: tuple[str, ...] = ("1K", "2K", "4K")
 
 
+@dataclass(frozen=True, slots=True)
+class AnnotationColorSpec:
+    """One consistently rendered and described edit-guide colour."""
+
+    color_id: str
+    label_key: str
+    fill_rgba: tuple[int, int, int, int]
+    border_rgba: tuple[int, int, int, int]
+
+
 API_PROVIDERS: dict[str, ProviderSpec] = {
     "openrouter": ProviderSpec(
         provider_id="openrouter",
@@ -91,19 +101,25 @@ MAX_UNDO_COMMANDS = 30
 ZOOM_MIN = 0.05
 ZOOM_MAX = 10.0
 ZOOM_STEP = 0.15
-ANNOTATION_COLOR = (245, 213, 71, 120)
-ANNOTATION_BORDER_COLOR = (245, 213, 71, 255)
+DEFAULT_ANNOTATION_COLOR = "red"
+ANNOTATION_COLORS: dict[str, AnnotationColorSpec] = {
+    "red": AnnotationColorSpec(
+        "red", "main.annotation.color.red", (255, 45, 45, 150), (255, 78, 78, 255)
+    ),
+    "green": AnnotationColorSpec(
+        "green", "main.annotation.color.green", (0, 225, 105, 150), (55, 255, 145, 255)
+    ),
+    "magenta": AnnotationColorSpec(
+        "magenta", "main.annotation.color.magenta", (255, 0, 205, 150), (255, 80, 225, 255)
+    ),
+    "cyan": AnnotationColorSpec(
+        "cyan", "main.annotation.color.cyan", (0, 205, 255, 150), (75, 225, 255, 255)
+    ),
+    "yellow": AnnotationColorSpec(
+        "yellow", "main.annotation.color.yellow", (245, 213, 71, 140), (255, 230, 90, 255)
+    ),
+}
+# Compatibility aliases for code that has not selected a colour explicitly.
+ANNOTATION_COLOR = ANNOTATION_COLORS[DEFAULT_ANNOTATION_COLOR].fill_rgba
+ANNOTATION_BORDER_COLOR = ANNOTATION_COLORS[DEFAULT_ANNOTATION_COLOR].border_rgba
 OUTPUT_DPI = 300.0
-EDIT_ANNOTATION_LABEL = "Annotated image (banana-yellow = region to edit):"
-
-EDIT_SYSTEM_PROMPT = """You are a precise, non-destructive image editor.
-
-You receive exactly TWO images:
-  IMAGE 1 — ORIGINAL: the image to edit.
-  IMAGE 2 — ANNOTATION GUIDE: a copy with translucent banana-yellow marks.
-
-Apply the user's requested changes only inside the yellow-marked regions.
-The final image must contain no annotation borders, tint, or guide marks.
-Preserve all unmarked content, layout, text, colors, style, and composition.
-Return a complete natural image, not a mask or explanation-only response.
-"""

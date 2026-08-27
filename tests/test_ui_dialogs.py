@@ -29,13 +29,16 @@ def test_preflight_keeps_exact_request_and_all_network_fields(app: QApplication)
         "API 预设": "Production",
         "预设 ID": "p",
         "服务商": "openrouter",
-        "模型": "short  ·  model/id",
+        "模型": "short · model/id",
         "尺寸": "2K",
         "比例": "16:9",
+        "参考像素尺寸": "2752 × 1536 px",
+        "保存格式": "PNG",
+        "保存 DPI": "300 DPI",
     }
 
 
-def test_edit_preflight_declares_png_yellow_guide_and_source_metadata(app: QApplication) -> None:
+def test_edit_preflight_declares_guide_mask_export_and_source_metadata(app: QApplication) -> None:
     image = QImage(8, 8, QImage.Format.Format_ARGB32)
     image.fill(QColor("black"))
     request = EditRequest(
@@ -49,8 +52,12 @@ def test_edit_preflight_declares_png_yellow_guide_and_source_metadata(app: QAppl
     assert dialog.summary["比例"] == "3:4"
     assert dialog.summary["原文件 / 编辑输出格式"] == "WEBP"
     assert dialog.summary["上传源图格式"] == "PNG"
-    assert dialog.summary["源 DPI"] == "144×144"
+    assert dialog.summary["源 DPI"] == "144 × 144"
     assert dialog.summary["标注格式"] == "PNG"
+    assert dialog.summary["标注颜色"] == "红色"
+    assert dialog.summary["选区蒙版"] == "黑底白区 PNG（白色区域允许修改）"
+    assert dialog.summary["保存格式"] == "PNG"
+    assert dialog.summary["保存 DPI"] == "300 DPI"
 
 
 class ConsoleSettingsFake:

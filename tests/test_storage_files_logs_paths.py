@@ -103,6 +103,10 @@ def edit_result() -> EditResult:
         source_fmt="jpeg",
         source_dpi=(72.0, 72.0),
         wire_source_fmt="png",
+        selection_mask_bytes=encoded_image("png", 100, 100),
+        annotation_color="green",
+        requested_output_format="jpeg",
+        requested_dpi=300.0,
     )
     return EditResult(
         image_bytes=encoded_image("jpeg", 100, 100, dpi=300.0),
@@ -131,6 +135,10 @@ def test_image_and_sidecar_commit_include_integrity_and_provenance(tmp_path: Pat
     assert metadata["preset_id"] == "preset_abc"
     assert metadata["image_sha256"] == hashlib.sha256(result.image_bytes).hexdigest()
     assert metadata["output_dpi"] == [300.0, 300.0]
+    assert metadata["requested_output_format"] == "png"
+    assert metadata["requested_dpi"] == 300.0
+    assert metadata["actual_output_format"] == "png"
+    assert metadata["actual_dpi"] == [300.0, 300.0]
     assert metadata["token_usage"] == {"input_tokens": 12, "output_tokens": 3}
     assert result.saved_path == str(image_path)
 
@@ -198,8 +206,14 @@ def test_edit_sidecar_records_actual_output_dpi_not_source_dpi(tmp_path: Path) -
     assert metadata["wire_source_fmt"] == "png"
     assert metadata["saved_dpi"] == [300.0, 300.0]
     assert metadata["output_dpi"] == [300.0, 300.0]
+    assert metadata["requested_output_format"] == "jpeg"
+    assert metadata["requested_dpi"] == 300.0
+    assert metadata["actual_output_format"] == "jpg"
+    assert metadata["actual_dpi"] == [300.0, 300.0]
     assert metadata["provider"] == "aihubmix"
     assert metadata["preset_id"] == "preset_xyz"
+    assert metadata["annotation_color"] == "green"
+    assert metadata["selection_mask_format"] == "png"
 
 
 def test_failed_or_unsupported_reencode_does_not_invent_output_dpi(tmp_path: Path) -> None:

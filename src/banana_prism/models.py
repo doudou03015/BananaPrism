@@ -36,6 +36,8 @@ class GenerationRequest:
     ratio: str
     preset_id: str
     provider: str
+    requested_output_format: str = "png"
+    requested_dpi: float = 300.0
 
 
 @dataclass(slots=True)
@@ -66,6 +68,10 @@ class EditRequest:
     source_fmt: str = "png"
     source_dpi: tuple[float, float] | None = None
     wire_source_fmt: str | None = None
+    selection_mask_bytes: bytes = b""
+    annotation_color: str = "red"
+    requested_output_format: str = "png"
+    requested_dpi: float = 300.0
 
 
 @dataclass(slots=True)
@@ -89,6 +95,8 @@ class QueuedTask:
     model_index: int
     size_index: int
     ratio: str
+    output_format: str = "png"
+    output_dpi: float = 300.0
     status: QueueStatus = QueueStatus.PENDING
     error_message: str = ""
 

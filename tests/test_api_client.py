@@ -164,7 +164,7 @@ def test_image_size_validation_rejects_lowercase_and_unsupported_legacy_resoluti
 
 def test_edit_payloads_preserve_recovered_provider_differences() -> None:
     original = png_bytes(2, 2)
-    annotated = png_bytes(3, 2)
+    annotated = png_bytes(2, 2)
     common = dict(
         api_key="test-key",
         model_id="google/a-current-model",
@@ -182,12 +182,16 @@ def test_edit_payloads_preserve_recovered_provider_differences() -> None:
         "text",
         "image_url",
     ]
-    assert content[2]["text"] == "Annotated image (banana-yellow = region to edit):"
+    assert content[2]["text"] == (
+        "IMAGE 2 — ANNOTATION GUIDE (bright red overlay = region to edit)."
+    )
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
     aihubmix = ApiClient.build_edit_request(provider="aihubmix", **common)
     parts = aihubmix.payload["contents"][0]["parts"]
-    assert parts[2] == {"text": "Annotated image (banana-yellow = region to edit):"}
+    assert parts[2] == {
+        "text": "IMAGE 2 — ANNOTATION GUIDE (bright red overlay = region to edit)."
+    }
     assert parts[2]["text"] == content[2]["text"]
     assert parts[1]["inlineData"]["mimeType"] == "image/png"
     assert parts[3]["inlineData"]["data"] == base64.b64encode(annotated).decode(
@@ -197,7 +201,7 @@ def test_edit_payloads_preserve_recovered_provider_differences() -> None:
 
 def test_openrouter_4k_edit_uses_ordered_images_api_references() -> None:
     original = png_bytes(2, 2)
-    annotated = png_bytes(3, 2)
+    annotated = png_bytes(2, 2)
     request = ApiClient.build_edit_request(
         provider="openrouter",
         api_key="test-key",
@@ -214,7 +218,7 @@ def test_openrouter_4k_edit_uses_ordered_images_api_references() -> None:
     assert request.payload["resolution"] == "4K"
     assert request.payload["aspect_ratio"] == "4:3"
     assert "IMAGE 1 — ORIGINAL" in request.payload["prompt"]
-    assert "IMAGE 2 — Annotated image" in request.payload["prompt"]
+    assert "IMAGE 2 — ANNOTATION GUIDE" in request.payload["prompt"]
     references = request.payload["input_references"]
     assert len(references) == 2
     assert all(reference["type"] == "image_url" for reference in references)
@@ -226,6 +230,86 @@ def test_openrouter_4k_edit_uses_ordered_images_api_references() -> None:
     assert base64.b64decode(
         references[1]["image_url"]["url"].split(",", 1)[1], validate=True
     ) == annotated
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "aihubmix"])
+def test_edit_payload_adds_authoritative_binary_mask_and_dynamic_color(
+    provider: str,
+) -> None:
+    original = png_bytes(5, 4)
+    annotated = png_bytes(5, 4)
+    mask = png_bytes(5, 4)
+    request = ApiClient.build_edit_request(
+        provider=provider,
+        api_key="test-key",
+        model_id="google/gemini-3.1-flash-image",
+        edit_prompt="replace only the selected area",
+        original_image=original,
+        annotated_image=annotated,
+        selection_mask=mask,
+        annotation_color="red",
+        image_size="4K" if provider == "openrouter" else "2K",
+        aspect_ratio="4:3",
+    )
+
+    if provider == "openrouter":
+        references = request.payload["input_references"]
+        assert len(references) == 3
+        prompt = request.payload["prompt"]
+        assert "bright red" in prompt
+        assert "WHITE = edit; BLACK = preserve" in prompt
+        encoded = references[2]["image_url"]["url"].split(",", 1)[1]
+    else:
+        parts = request.payload["contents"][0]["parts"]
+        assert len(parts) == 6
+        assert "bright red" in parts[0]["text"]
+        assert "WHITE = edit; BLACK = preserve" in parts[4]["text"]
+        encoded = parts[5]["inlineData"]["data"]
+    assert base64.b64decode(encoded, validate=True) == mask
+
+
+def test_edit_payload_rejects_unknown_annotation_color() -> None:
+    with pytest.raises(ValueError, match="annotation color"):
+        ApiClient.build_edit_request(
+            provider="openrouter",
+            api_key="test-key",
+            model_id="google/gemini-3.1-flash-image",
+            edit_prompt="edit",
+            original_image=png_bytes(2, 2),
+            annotated_image=png_bytes(2, 2),
+            annotation_color="ultraviolet-user-input",
+            image_size="1K",
+            aspect_ratio="1:1",
+        )
+
+
+def test_edit_payload_rejects_misaligned_guide_and_mask() -> None:
+    common = dict(
+        provider="aihubmix",
+        api_key="test-key",
+        model_id="google/gemini-3.1-flash-image",
+        edit_prompt="edit only the selection",
+        original_image=png_bytes(8, 6),
+        image_size="2K",
+        aspect_ratio="4:3",
+    )
+    with pytest.raises(ValueError, match="Annotation guide dimensions"):
+        ApiClient.build_edit_request(
+            **common,
+            annotated_image=png_bytes(7, 6),
+        )
+    with pytest.raises(ValueError, match="Selection mask dimensions"):
+        ApiClient.build_edit_request(
+            **common,
+            annotated_image=png_bytes(8, 6),
+            selection_mask=png_bytes(8, 5),
+        )
+    with pytest.raises(ValueError, match="lossless PNG"):
+        ApiClient.build_edit_request(
+            **common,
+            annotated_image=png_bytes(8, 6),
+            selection_mask=bmp_bytes(),
+        )
 
 
 def test_bmp_edit_inputs_are_normalized_to_provider_compatible_png() -> None:

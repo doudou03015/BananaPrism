@@ -27,6 +27,7 @@ def png_bytes() -> bytes:
 class FakeReply(QObject):
     readyRead = Signal()
     finished = Signal()
+    uploadProgress = Signal(int, int)
     downloadProgress = Signal(int, int)
     metaDataChanged = Signal()
     sslErrors = Signal(object)
@@ -118,6 +119,163 @@ def request(provider: str = "openrouter"):
         image_size="1K",
         aspect_ratio="1:1",
     )
+
+
+def start_openrouter_4k_edit(service: ImageService):
+    raw = png_bytes()
+    return service.start_edit(
+        provider="openrouter",
+        api_key="test-key",
+        model_id="google/gemini-3.1-flash-image",
+        edit_prompt="change only the marked area",
+        original_image=raw,
+        annotated_image=raw,
+        image_size="4K",
+        aspect_ratio="1:1",
+    )
+
+
+def test_openrouter_4k_edit_has_long_deadline_but_other_requests_keep_timeout() -> None:
+    app()
+    manager = FakeManager()
+    service = ImageService(
+        network_manager=manager,
+        request_timeout_ms=300_000,
+        openrouter_4k_edit_timeout_ms=900_000,
+    )
+
+    edit = start_openrouter_4k_edit(service)
+    assert edit.accepted
+    edit_request = manager.posts[-1][0]
+    assert edit_request.transferTimeout() == 900_000
+    assert service._timeout.interval() == 900_000
+    assert service._deadline.isActive()
+    assert service._deadline.interval() == 900_000
+    service.cancel(edit.job_id)
+
+    ordinary = service.start(request())
+    assert ordinary.accepted
+    ordinary_request = manager.posts[-1][0]
+    assert ordinary_request.transferTimeout() == 300_000
+    assert service._timeout.interval() == 300_000
+    assert service._deadline.isActive()
+    assert service._deadline.interval() == 300_000
+    service.cancel(ordinary.job_id)
+
+    # A 4K generation uses the Images API too, but only edits carry large input
+    # references and receive the extended deadline.
+    generation = service.start_generation(
+        provider="openrouter",
+        api_key="test-key",
+        model_id="google/gemini-3.1-flash-image",
+        prompt="test",
+        image_size="4K",
+        aspect_ratio="1:1",
+    )
+    assert generation.accepted
+    assert manager.posts[-1][0].transferTimeout() == 300_000
+    assert service._deadline.isActive()
+    assert service._deadline.interval() == 300_000
+    service.cancel(generation.job_id)
+
+
+def test_upload_progress_refreshes_timeout_and_reports_all_transport_stages() -> None:
+    app()
+    manager = FakeManager()
+    service = ImageService(
+        network_manager=manager,
+        request_timeout_ms=300,
+        openrouter_4k_edit_timeout_ms=900,
+    )
+    detailed = []
+    compatible = []
+    service.progress_stage.connect(
+        lambda job, stage, current, total: detailed.append(
+            (job, stage, current, total)
+        )
+    )
+    service.progress.connect(
+        lambda job, current, total: compatible.append((job, current, total))
+    )
+
+    started = start_openrouter_4k_edit(service)
+    reply = manager.posts[-1][2]
+    body_size = len(manager.posts[-1][1])
+    assert detailed[0] == (started.job_id, "uploading", 0, body_size)
+
+    # Simulate the old 300 ms timer being close to expiry. Real upload activity
+    # must refresh it with the extended edit timeout, not retain the stale value.
+    service._timeout.start(300)
+    reply.uploadProgress.emit(body_size // 2, body_size)
+    assert service._timeout.interval() == 900
+    assert detailed[-1] == (
+        started.job_id,
+        "uploading",
+        body_size // 2,
+        body_size,
+    )
+    assert compatible == []
+
+    # Duplicate/no-growth progress events must not refresh the inactivity timer.
+    service._timeout.start(25)
+    reply.uploadProgress.emit(body_size // 2, body_size)
+    assert service._timeout.interval() == 25
+
+    reply.uploadProgress.emit(body_size, body_size)
+    assert detailed[-2] == (started.job_id, "uploading", body_size, body_size)
+    assert detailed[-1] == (started.job_id, "generating", 0, -1)
+
+    reply.downloadProgress.emit(4096, 8192)
+    assert detailed[-1] == (started.job_id, "downloading", 4096, 8192)
+    assert compatible[-1] == (started.job_id, 4096, 8192)
+    service.cancel(started.job_id)
+
+
+def test_long_edit_deadline_and_late_reply_still_emit_one_terminal() -> None:
+    app()
+    manager = FakeManager()
+    service = ImageService(
+        network_manager=manager,
+        request_timeout_ms=300,
+        openrouter_4k_edit_timeout_ms=900,
+    )
+    terminals = []
+    errors = []
+    service.terminal.connect(lambda job, state: terminals.append((job, state)))
+    service.error.connect(lambda job, message: errors.append((job, message)))
+
+    started = start_openrouter_4k_edit(service)
+    reply = manager.posts[-1][2]
+    service._on_deadline()
+
+    assert terminals == [(started.job_id, TerminalState.ERROR)]
+    assert len(errors) == 1
+    assert '"timeout_ms":900' in errors[0][1]
+    assert service.state is JobState.IDLE
+
+    reply.deliver(b"{}")
+    assert terminals == [(started.job_id, TerminalState.ERROR)]
+    assert len(errors) == 1
+
+
+def test_cancel_from_initial_upload_stage_does_not_post_a_zombie_request() -> None:
+    app()
+    manager = FakeManager()
+    service = ImageService(network_manager=manager)
+    terminals = []
+    service.progress_stage.connect(
+        lambda job, stage, current, total: service.cancel(job)
+        if stage == "uploading"
+        else None
+    )
+    service.terminal.connect(lambda job, state: terminals.append((job, state)))
+
+    started = start_openrouter_4k_edit(service)
+
+    assert started.accepted
+    assert manager.posts == []
+    assert terminals == [(started.job_id, TerminalState.CANCELLED)]
+    assert service.state is JobState.IDLE
 
 
 def test_start_busy_cancel_and_late_reply_are_exactly_once() -> None:

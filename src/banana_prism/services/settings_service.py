@@ -40,6 +40,9 @@ from banana_prism.utils.paths import (
 
 MAX_SETTINGS_BYTES = 1024 * 1024
 MAX_PRESETS = 100
+_OUTPUT_FORMATS = frozenset({"png", "jpeg"})
+_OUTPUT_DPIS = frozenset({72, 96, 150, 300})
+_ANNOTATION_COLORS = frozenset({"red", "green", "magenta", "cyan", "yellow"})
 _FORBIDDEN_SECRET_FIELDS = frozenset(
     {"api_key", "console_password_hash", "password", "token", "secret"}
 )
@@ -166,6 +169,9 @@ def validate_settings_document(document: object) -> dict[str, Any]:
         "last_model_index",
         "last_size_index",
         "last_ratio",
+        "last_output_format",
+        "last_output_dpi",
+        "last_annotation_color",
         "save_dir",
         "prompt_save_length",
         "today_gen",
@@ -178,11 +184,44 @@ def validate_settings_document(document: object) -> dict[str, Any]:
         "secret_store",
         "migration",
     }
-    required = allowed - {"secret_store", "migration"}
+    # The three output/annotation preferences were added while schema v1 was
+    # already in the field.  Keep them optional on read so existing installs
+    # upgrade in place instead of being rejected as corrupt settings.
+    optional = {
+        "secret_store",
+        "migration",
+        "last_output_format",
+        "last_output_dpi",
+        "last_annotation_color",
+    }
+    required = allowed - optional
     if not set(document).issubset(allowed) or not required.issubset(document):
         raise SettingsValidationError("settings fields do not match the supported schema")
     if document.get("schema_version") != SETTINGS_SCHEMA_VERSION:
         raise SettingsValidationError("settings schema version is unsupported")
+
+    # These are display/export preferences rather than integrity-bearing
+    # fields.  Recover only their known-safe values while retaining strict
+    # validation for paths, presets, credentials and the rest of the schema.
+    document = copy.deepcopy(document)
+    output_format = document.get("last_output_format")
+    document["last_output_format"] = (
+        output_format if isinstance(output_format, str) and output_format in _OUTPUT_FORMATS else "png"
+    )
+    output_dpi = document.get("last_output_dpi")
+    document["last_output_dpi"] = (
+        int(output_dpi)
+        if not isinstance(output_dpi, bool)
+        and isinstance(output_dpi, (int, float))
+        and float(output_dpi) in _OUTPUT_DPIS
+        else 300
+    )
+    annotation_color = document.get("last_annotation_color")
+    document["last_annotation_color"] = (
+        annotation_color
+        if isinstance(annotation_color, str) and annotation_color in _ANNOTATION_COLORS
+        else "red"
+    )
 
     model_index = document.get("last_model_index")
     if not _is_int(model_index) or not 0 <= cast(int, model_index) < len(MODELS):
@@ -280,6 +319,9 @@ def default_settings_document(*, on_date: date | None = None) -> dict[str, Any]:
         "last_model_index": 0,
         "last_size_index": 0,
         "last_ratio": DEFAULT_RATIO,
+        "last_output_format": "png",
+        "last_output_dpi": 300,
+        "last_annotation_color": "red",
         "save_dir": str(get_default_save_dir(create=False)),
         "prompt_save_length": PROMPT_SAVE_LENGTH_DEFAULT,
         "today_gen": {"date": current_date.isoformat(), "count": 0},
@@ -523,6 +565,30 @@ class SettingsService:
     @last_ratio.setter
     def last_ratio(self, value: str) -> None:
         self.set("last_ratio", value)
+
+    @property
+    def last_output_format(self) -> str:
+        return cast(str, self.get("last_output_format", "png"))
+
+    @last_output_format.setter
+    def last_output_format(self, value: str) -> None:
+        self.set("last_output_format", value)
+
+    @property
+    def last_output_dpi(self) -> int:
+        return cast(int, self.get("last_output_dpi", 300))
+
+    @last_output_dpi.setter
+    def last_output_dpi(self, value: int) -> None:
+        self.set("last_output_dpi", value)
+
+    @property
+    def last_annotation_color(self) -> str:
+        return cast(str, self.get("last_annotation_color", "red"))
+
+    @last_annotation_color.setter
+    def last_annotation_color(self, value: str) -> None:
+        self.set("last_annotation_color", value)
 
     @property
     def save_dir(self) -> str:

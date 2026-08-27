@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from banana_prism.constants import ANNOTATION_COLORS, SIZE_DIMENSIONS
 from banana_prism.i18n import tr
 from banana_prism.models import EditRequest, GenerationRequest
 
@@ -35,12 +36,13 @@ class PreflightDialog(QDialog):
         preset_name: str = "",
         source_image: QImage | bytes | None = None,
         annotated_image: QImage | bytes | None = None,
+        selection_mask: QImage | bytes | None = None,
     ) -> None:
         super().__init__(parent)
         self.setObjectName("preflightDialog")
         self.setWindowTitle(tr("preflight.title"))
         self.setModal(True)
-        self.resize(720, 590)
+        self.resize(900, 620)
         self.request = request
         self.summary = self._build_summary(request, preset_name)
 
@@ -70,10 +72,12 @@ class PreflightDialog(QDialog):
         if isinstance(request, EditRequest):
             source = self._to_image(source_image or request.source_image_bytes)
             guide = self._to_image(annotated_image or request.annotated_image_bytes)
+            mask = self._to_image(selection_mask or request.selection_mask_bytes)
             preview_row.addWidget(self._preview_card(tr("preflight.preview.source"), source))
             preview_row.addWidget(
                 self._preview_card(tr("preflight.preview.annotation"), guide)
             )
+            preview_row.addWidget(self._preview_card(tr("preflight.preview.mask"), mask))
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -113,6 +117,12 @@ class PreflightDialog(QDialog):
 
     @staticmethod
     def _build_summary(request: GenerationRequest | EditRequest, preset_name: str) -> dict[str, str]:
+        dimensions = SIZE_DIMENSIONS.get(request.size, {}).get(request.ratio)
+        annotation = (
+            ANNOTATION_COLORS.get(request.annotation_color)
+            if isinstance(request, EditRequest)
+            else None
+        )
         return {
             tr("preflight.field.operation"): tr(
                 "preflight.operation.edit"
@@ -122,22 +132,37 @@ class PreflightDialog(QDialog):
             tr("preflight.field.preset"): preset_name or request.preset_id,
             tr("preflight.field.preset_id"): request.preset_id,
             tr("preflight.field.provider"): request.provider,
-            tr("preflight.field.model"): f"{request.model_short_name}  ·  {request.model_id}",
+            tr("preflight.field.model"): f"{request.model_short_name} · {request.model_id}",
             tr("preflight.field.size"): request.size,
             tr("preflight.field.ratio"): request.ratio,
+            tr("preflight.field.pixel_dimensions"): (
+                f"{dimensions[0]} × {dimensions[1]} px"
+                if dimensions is not None
+                else tr("common.not_provided")
+            ),
+            tr("preflight.field.output_format"): request.requested_output_format.upper(),
+            tr("preflight.field.output_dpi"): f"{request.requested_dpi:g} DPI",
             **(
                 {
                     tr("preflight.field.source_format"): request.source_fmt.upper(),
                     tr("preflight.field.wire_source_format"): (
                         request.wire_source_fmt or request.source_fmt
                     ).upper(),
-                    tr("preflight.field.source_dpi"): "×".join(
+                    tr("preflight.field.source_dpi"): " × ".join(
                         f"{value:g}" for value in request.source_dpi
                     )
                     if request.source_dpi
                     else tr("common.not_provided"),
                     tr("preflight.field.annotation_format"): tr(
                         "preflight.annotation_format.png"
+                    ),
+                    tr("preflight.field.annotation_color"): (
+                        tr(annotation.label_key)
+                        if annotation is not None
+                        else request.annotation_color
+                    ),
+                    tr("preflight.field.selection_mask"): tr(
+                        "preflight.selection_mask.png"
                     ),
                 }
                 if isinstance(request, EditRequest)

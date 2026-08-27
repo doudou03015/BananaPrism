@@ -39,6 +39,7 @@ from banana_prism.services.log_service import redact_sensitive_text
 
 
 _API_ERROR_PREFIX = "BANANAPRISM_API_ERROR:"
+_OPENROUTER_4K_EDIT_TIMEOUT_MS = 900_000
 
 
 class TerminalState(str, Enum):
@@ -76,6 +77,10 @@ class ImageService(QObject):
     started = Signal(str)
     state_changed = Signal(str, object)  # job_id, JobState
     progress = Signal(str, int, int)  # job_id, received bytes, total (-1 unknown)
+    # Detailed transport progress for UIs that want to distinguish the request
+    # upload, provider-side generation wait, and response download.  ``progress``
+    # intentionally remains unchanged for existing consumers.
+    progress_stage = Signal(str, str, int, int)  # job_id, stage, current, total
     success = Signal(str, object)  # job_id, ApiResult
     error = Signal(str, str)
     text_only = Signal(str, str)
@@ -89,6 +94,7 @@ class ImageService(QObject):
         network_manager: QNetworkAccessManager | None = None,
         host_lookup: HostLookup | None = None,
         request_timeout_ms: int = REQUEST_TIMEOUT_MS,
+        openrouter_4k_edit_timeout_ms: int = _OPENROUTER_4K_EDIT_TIMEOUT_MS,
         remote_timeout_ms: int = REMOTE_IMAGE_TIMEOUT_MS,
         max_response_bytes: int = MAX_RESPONSE_BYTES,
         max_image_pixels: int = MAX_IMAGE_PIXELS,
@@ -98,6 +104,9 @@ class ImageService(QObject):
         self._manager = network_manager or QNetworkAccessManager(self)
         self._host_lookup = host_lookup or self._qt_host_lookup
         self._request_timeout_ms = max(1, int(request_timeout_ms))
+        self._openrouter_4k_edit_timeout_ms = max(
+            self._request_timeout_ms, int(openrouter_4k_edit_timeout_ms)
+        )
         self._remote_timeout_ms = max(1, int(remote_timeout_ms))
         self._max_response_bytes = max(1, int(max_response_bytes))
         self._max_image_pixels = max(1, int(max_image_pixels))
@@ -113,10 +122,19 @@ class ImageService(QObject):
         self._parsed_result: ApiResult | None = None
         self._remote_original_url: str | None = None
         self._ssl_error_detail = ""
+        self._active_request_timeout_ms = self._request_timeout_ms
+        self._has_total_deadline = False
+        self._progress_stage = ""
+        self._upload_progress_connected = False
+        self._last_upload_bytes = 0
+        self._last_download_bytes = 0
 
         self._timeout = QTimer(self)
         self._timeout.setSingleShot(True)
         self._timeout.timeout.connect(self._on_timeout)
+        self._deadline = QTimer(self)
+        self._deadline.setSingleShot(True)
+        self._deadline.timeout.connect(self._on_deadline)
 
     @property
     def state(self) -> JobState:
@@ -195,13 +213,54 @@ class ImageService(QObject):
         return request
 
     def _start_api_request(self, spec: ApiRequest) -> None:
-        request = self._make_request(spec.url, self._request_timeout_ms)
+        is_long_edit = self._is_openrouter_4k_edit(spec)
+        timeout_ms = (
+            self._openrouter_4k_edit_timeout_ms
+            if is_long_edit
+            else self._request_timeout_ms
+        )
+        self._active_request_timeout_ms = timeout_ms
+        self._has_total_deadline = True
+        request = self._make_request(spec.url, timeout_ms)
         for name, value in spec.headers.items():
             request.setRawHeader(name.encode("ascii"), value.encode("utf-8"))
         self._stage = "api"
+        self._progress_stage = "uploading"
+        self._last_upload_bytes = 0
+        self._last_download_bytes = 0
         self._buffer.clear()
-        reply = self._manager.post(request, QByteArray(spec.body))
-        self._attach_reply(reply, self._request_timeout_ms)
+        body = spec.body
+        job_id = self._job_id
+        if job_id:
+            self.progress_stage.emit(job_id, "uploading", 0, len(body))
+            if self._job_id != job_id:
+                return
+        reply = self._manager.post(request, QByteArray(body))
+        self._attach_reply(reply, timeout_ms)
+        if self._job_id is not None:
+            # Absolute API deadline. Activity refreshes only the separate
+            # inactivity timer and can never make a request run forever.
+            self._deadline.start(timeout_ms)
+
+    @staticmethod
+    def _is_openrouter_4k_edit(spec: ApiRequest) -> bool:
+        """Return whether *spec* is the slow OpenRouter Images edit profile.
+
+        ``ApiRequest`` deliberately has no transport-policy fields.  The shape is
+        nevertheless unambiguous: 4K uses OpenRouter's Images API and an edit has
+        ordered ``input_references``.  Generation requests and every AiHubMix
+        request keep the normal five-minute timeout.
+        """
+
+        provider = getattr(spec.provider, "value", str(spec.provider)).casefold()
+        payload = spec.payload
+        references = payload.get("input_references")
+        return (
+            provider == "openrouter"
+            and str(payload.get("resolution", "")).upper() == "4K"
+            and isinstance(references, list)
+            and bool(references)
+        )
 
     def _attach_reply(self, reply: Any, timeout_ms: int) -> None:
         if self._job_id is None:
@@ -213,6 +272,13 @@ class ImageService(QObject):
         self._reply = reply
         reply.readyRead.connect(lambda r=reply: self._read_available(r))
         reply.finished.connect(lambda r=reply: self._reply_finished(r))
+        if self._stage == "api" and hasattr(reply, "uploadProgress"):
+            reply.uploadProgress.connect(
+                lambda sent, total, r=reply: self._emit_upload_progress(
+                    r, sent, total
+                )
+            )
+            self._upload_progress_connected = True
         if hasattr(reply, "downloadProgress"):
             reply.downloadProgress.connect(
                 lambda received, total, r=reply: self._emit_progress(r, received, total)
@@ -224,6 +290,37 @@ class ImageService(QObject):
                 lambda errors, r=reply: self._remember_ssl_errors(r, errors)
             )
         self._timeout.start(timeout_ms)
+
+    def _touch_transport_timeout(self, reply: Any) -> None:
+        """Refresh the inactivity timer when bytes are actually moving."""
+
+        if reply is not self._reply or self._job_id is None:
+            return
+        timeout_ms = (
+            self._remote_timeout_ms
+            if self._stage in {"remote", "resolving"}
+            else self._active_request_timeout_ms
+        )
+        self._timeout.start(timeout_ms)
+
+    def _emit_upload_progress(self, reply: Any, sent: int, total: int) -> None:
+        if reply is not self._reply or self._job_id is None:
+            return
+        job_id = self._job_id
+        sent_value = int(sent)
+        total_value = int(total)
+        if sent_value > self._last_upload_bytes:
+            self._last_upload_bytes = sent_value
+            self._touch_transport_timeout(reply)
+        self._progress_stage = "uploading"
+        self.progress_stage.emit(
+            job_id, "uploading", sent_value, total_value
+        )
+        if reply is not self._reply or self._job_id != job_id:
+            return
+        if total_value >= 0 and sent_value >= total_value:
+            self._progress_stage = "generating"
+            self.progress_stage.emit(job_id, "generating", 0, -1)
 
     def _remember_ssl_errors(self, reply: Any, errors: Any) -> None:
         if reply is not self._reply or self._job_id is None:
@@ -238,7 +335,18 @@ class ImageService(QObject):
 
     def _emit_progress(self, reply: Any, received: int, total: int) -> None:
         if reply is self._reply and self._job_id:
-            self.progress.emit(self._job_id, int(received), int(total))
+            job_id = self._job_id
+            received_value = int(received)
+            total_value = int(total)
+            if received_value > self._last_download_bytes:
+                self._last_download_bytes = received_value
+                self._touch_transport_timeout(reply)
+            self._progress_stage = "downloading"
+            self.progress_stage.emit(
+                job_id, "downloading", received_value, total_value
+            )
+            if reply is self._reply and self._job_id == job_id:
+                self.progress.emit(job_id, received_value, total_value)
 
     def _metadata_changed(self, reply: Any) -> None:
         if reply is not self._reply or self._job_id is None:
@@ -259,7 +367,20 @@ class ImageService(QObject):
     def _read_available(self, reply: Any) -> None:
         if reply is not self._reply or self._job_id is None:
             return
-        self._buffer.extend(bytes(reply.readAll()))
+        chunk = bytes(reply.readAll())
+        if chunk:
+            job_id = self._job_id
+            self._touch_transport_timeout(reply)
+            next_size = len(self._buffer) + len(chunk)
+            self._buffer.extend(chunk)
+            self._last_download_bytes = max(self._last_download_bytes, next_size)
+            if self._progress_stage != "downloading":
+                self._progress_stage = "downloading"
+                self.progress_stage.emit(
+                    job_id, "downloading", next_size, -1
+                )
+                if reply is not self._reply or self._job_id != job_id:
+                    return
         if len(self._buffer) > self._max_response_bytes:
             self._finish(
                 TerminalState.ERROR,
@@ -379,7 +500,17 @@ class ImageService(QObject):
             self._finish(TerminalState.ERROR, self._safe_error(exc))
             return
         job_id = self._job_id
+        if redirect_count == 0:
+            # The API call has completed. Give the separately validated remote
+            # image fetch its own bounded deadline; redirects do not reset it.
+            self._deadline.stop()
+            self._active_request_timeout_ms = self._remote_timeout_ms
+            self._has_total_deadline = True
+            self._deadline.start(self._remote_timeout_ms)
+            self._last_download_bytes = 0
         self._stage = "resolving"
+        self._progress_stage = "downloading"
+        self.progress_stage.emit(job_id, "downloading", 0, -1)
         self._timeout.start(self._remote_timeout_ms)
 
         def resolved(result: Sequence[str] | Exception) -> None:
@@ -463,21 +594,36 @@ class ImageService(QObject):
             timeout_ms = (
                 self._remote_timeout_ms
                 if self._stage in {"remote", "resolving"}
-                else self._request_timeout_ms
+                else self._active_request_timeout_ms
             )
             self._finish(
                 TerminalState.ERROR,
                 self._provider_error("timeout", timeout_ms=timeout_ms),
             )
 
+    def _on_deadline(self) -> None:
+        if self._job_id is not None and self._has_total_deadline:
+            self._finish(
+                TerminalState.ERROR,
+                self._provider_error(
+                    "timeout", timeout_ms=self._active_request_timeout_ms
+                ),
+            )
+
     def _release_reply(self, reply: Any) -> None:
         if reply is not self._reply:
             return
+        upload_progress_connected = self._upload_progress_connected
+        self._upload_progress_connected = False
+        self._last_upload_bytes = 0
+        self._last_download_bytes = 0
         self._reply = None
         self._buffer.clear()
         try:
             reply.readyRead.disconnect()
             reply.finished.disconnect()
+            if upload_progress_connected and hasattr(reply, "uploadProgress"):
+                reply.uploadProgress.disconnect()
             if hasattr(reply, "downloadProgress"):
                 reply.downloadProgress.disconnect()
             if hasattr(reply, "metaDataChanged"):
@@ -494,13 +640,21 @@ class ImageService(QObject):
         self._terminal_emitted = True
         job_id = self._job_id
         reply = self._reply
+        upload_progress_connected = self._upload_progress_connected
         self._reply = None
         self._timeout.stop()
+        self._deadline.stop()
         self._buffer.clear()
         self._api_request = None
         self._parsed_result = None
         self._remote_original_url = None
         self._ssl_error_detail = ""
+        self._active_request_timeout_ms = self._request_timeout_ms
+        self._has_total_deadline = False
+        self._progress_stage = ""
+        self._upload_progress_connected = False
+        self._last_upload_bytes = 0
+        self._last_download_bytes = 0
         self._stage = ""
         self._job_id = None
         self._state = JobState.IDLE
@@ -509,6 +663,8 @@ class ImageService(QObject):
             try:
                 reply.readyRead.disconnect()
                 reply.finished.disconnect()
+                if upload_progress_connected and hasattr(reply, "uploadProgress"):
+                    reply.uploadProgress.disconnect()
                 if hasattr(reply, "downloadProgress"):
                     reply.downloadProgress.disconnect()
                 if hasattr(reply, "metaDataChanged"):

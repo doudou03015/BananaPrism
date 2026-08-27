@@ -23,8 +23,6 @@ from PySide6.QtCore import QByteArray, QBuffer, QIODevice
 from PySide6.QtGui import QImage, QImageReader
 
 from banana_prism.constants import (
-    EDIT_ANNOTATION_LABEL,
-    EDIT_SYSTEM_PROMPT,
     MAX_IMAGE_PIXELS,
     MAX_RESPONSE_BYTES,
     SIZES,
@@ -39,6 +37,13 @@ _DATA_URI_RE = re.compile(
     re.IGNORECASE,
 )
 _SUPPORTED_FORMATS = {"png", "jpeg", "jpg", "webp", "bmp"}
+_ANNOTATION_PROMPT_COLORS = {
+    "red": "bright red",
+    "green": "bright green",
+    "magenta": "bright magenta",
+    "cyan": "bright cyan",
+    "yellow": "banana-yellow",
+}
 _NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 _NAT64_LOCAL_USE_PREFIX = ipaddress.ip_network("64:ff9b:1::/48")
 
@@ -125,6 +130,38 @@ def _validate_api_key(api_key: str) -> str:
     if "\r" in key or "\n" in key:
         raise ApiClientError("API key contains invalid header characters")
     return key
+
+
+def _edit_instruction(annotation_color: str, *, has_mask: bool) -> tuple[str, str, str]:
+    color = _ANNOTATION_PROMPT_COLORS.get(str(annotation_color).strip().lower())
+    if color is None:
+        raise ApiClientError(f"Unsupported annotation color: {annotation_color!r}")
+    image_count = "THREE" if has_mask else "TWO"
+    mask_section = (
+        "\n  IMAGE 3 — BINARY SELECTION MASK: WHITE pixels are editable; "
+        "BLACK pixels must remain unchanged.\n"
+        "The binary mask is authoritative if the colored guide is ambiguous."
+        if has_mask
+        else ""
+    )
+    system = f"""You are a precise, non-destructive image editor.
+
+You receive exactly {image_count} images:
+  IMAGE 1 — ORIGINAL: the image to edit.
+  IMAGE 2 — ANNOTATION GUIDE: a copy with translucent {color} marks.{mask_section}
+
+Apply the user's requested changes only inside the selected regions.
+The final image must contain no annotation borders, tint, guide marks, or mask.
+Preserve every unselected pixel as closely as possible, including layout, text,
+colors, style, and composition. Return a complete natural image, not a mask or
+an explanation-only response."""
+    annotation_label = (
+        f"IMAGE 2 — ANNOTATION GUIDE ({color} overlay = region to edit)."
+    )
+    mask_label = (
+        "IMAGE 3 — BINARY SELECTION MASK (WHITE = edit; BLACK = preserve)."
+    )
+    return system, annotation_label, mask_label
 
 
 def _mime_alias(value: str) -> str:
@@ -413,6 +450,8 @@ class ApiClient:
         edit_prompt: str,
         original_image: bytes,
         annotated_image: bytes,
+        selection_mask: bytes | None = None,
+        annotation_color: str = "red",
         image_size: str,
         aspect_ratio: str,
         api_url: str | None = None,
@@ -420,9 +459,28 @@ class ApiClient:
         selected = _provider(provider)
         original = _provider_input_image(original_image)
         annotation = _provider_input_image(annotated_image)
+        mask = validate_image_bytes(selection_mask) if selection_mask else None
+        original_size = (original.width, original.height)
+        if annotation.fmt != "png":
+            raise ImageValidationError("Annotation guide must be a lossless PNG")
+        if (annotation.width, annotation.height) != original_size:
+            raise ImageValidationError(
+                "Annotation guide dimensions must match the original image"
+            )
+        if mask is not None:
+            if mask.fmt != "png":
+                raise ImageValidationError("Selection mask must be a lossless PNG")
+            if (mask.width, mask.height) != original_size:
+                raise ImageValidationError(
+                    "Selection mask dimensions must match the original image"
+                )
+        system_prompt, annotation_label, mask_label = _edit_instruction(
+            annotation_color,
+            has_mask=mask is not None,
+        )
         combined = (
             "[System instruction]\n"
-            f"{EDIT_SYSTEM_PROMPT}\n\n"
+            f"{system_prompt}\n\n"
             "[User edit request]\n"
             f"{edit_prompt}"
         )
@@ -446,21 +504,32 @@ class ApiClient:
             f"data:{annotation.mime_type};base64,"
             f"{base64.b64encode(annotation.data).decode('ascii')}"
         )
+        mask_uri = (
+            f"data:{mask.mime_type};base64,"
+            f"{base64.b64encode(mask.data).decode('ascii')}"
+            if mask is not None
+            else None
+        )
         if selected is Provider.OPENROUTER:
             payload = dict(request.payload)
             if "messages" in payload:
+                content: list[dict[str, Any]] = [
+                    {"type": "text", "text": combined},
+                    {"type": "image_url", "image_url": {"url": original_uri}},
+                    {"type": "text", "text": annotation_label},
+                    {"type": "image_url", "image_url": {"url": annotation_uri}},
+                ]
+                if mask_uri is not None:
+                    content.extend(
+                        [
+                            {"type": "text", "text": mask_label},
+                            {"type": "image_url", "image_url": {"url": mask_uri}},
+                        ]
+                    )
                 payload["messages"] = [
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "text", "text": combined},
-                            {"type": "image_url", "image_url": {"url": original_uri}},
-                            {
-                                "type": "text",
-                                "text": EDIT_ANNOTATION_LABEL,
-                            },
-                            {"type": "image_url", "image_url": {"url": annotation_uri}},
-                        ],
+                        "content": content,
                     }
                 ]
             else:
@@ -471,33 +540,51 @@ class ApiClient:
                     f"{combined}\n\n"
                     "[Reference mapping]\n"
                     "IMAGE 1 — ORIGINAL.\n"
-                    f"IMAGE 2 — {EDIT_ANNOTATION_LABEL}"
+                    f"{annotation_label}"
+                    + (f"\n{mask_label}" if mask_uri is not None else "")
                 )
                 payload["input_references"] = [
                     {"type": "image_url", "image_url": {"url": original_uri}},
                     {"type": "image_url", "image_url": {"url": annotation_uri}},
                 ]
+                if mask_uri is not None:
+                    payload["input_references"].append(
+                        {"type": "image_url", "image_url": {"url": mask_uri}}
+                    )
         else:
             payload = dict(request.payload)
+            parts: list[dict[str, Any]] = [
+                {"text": combined},
+                {
+                    "inlineData": {
+                        "mimeType": original.mime_type,
+                        "data": base64.b64encode(original.data).decode("ascii"),
+                    }
+                },
+                {"text": annotation_label},
+                {
+                    "inlineData": {
+                        "mimeType": annotation.mime_type,
+                        "data": base64.b64encode(annotation.data).decode("ascii"),
+                    }
+                },
+            ]
+            if mask is not None:
+                parts.extend(
+                    [
+                        {"text": mask_label},
+                        {
+                            "inlineData": {
+                                "mimeType": mask.mime_type,
+                                "data": base64.b64encode(mask.data).decode("ascii"),
+                            }
+                        },
+                    ]
+                )
             payload["contents"] = [
                 {
                     "role": "user",
-                    "parts": [
-                        {"text": combined},
-                        {
-                            "inlineData": {
-                                "mimeType": original.mime_type,
-                                "data": base64.b64encode(original.data).decode("ascii"),
-                            }
-                        },
-                        {"text": EDIT_ANNOTATION_LABEL},
-                        {
-                            "inlineData": {
-                                "mimeType": annotation.mime_type,
-                                "data": base64.b64encode(annotation.data).decode("ascii"),
-                            }
-                        },
-                    ],
+                    "parts": parts,
                 }
             ]
         return ApiRequest(request.provider, request.url, request.headers, payload)

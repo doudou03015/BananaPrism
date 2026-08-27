@@ -157,6 +157,9 @@ def test_settings_defaults_validation_and_today_rollover(tmp_path: Path) -> None
     assert settings.last_model_index == 0
     assert settings.last_size_index == 0
     assert settings.last_ratio == "1:1"
+    assert settings.last_output_format == "png"
+    assert settings.last_output_dpi == 300
+    assert settings.last_annotation_color == "red"
     assert settings.prompt_save_length == 30
     assert settings.today_count == 0
 
@@ -164,6 +167,32 @@ def test_settings_defaults_validation_and_today_rollover(tmp_path: Path) -> None
     assert settings.prompt_save_length == 100
     assert settings.increment_generation_count(on_date=__import__("datetime").date(2026, 8, 26)) == 1
     assert settings.get_today_generation_count(on_date=__import__("datetime").date(2026, 8, 27)) == 0
+
+    settings.set_many(
+        {
+            "last_output_format": "jpeg",
+            "last_output_dpi": 150,
+            "last_annotation_color": "green",
+        }
+    )
+    settings.reload()
+    assert settings.last_output_format == "jpeg"
+    assert settings.last_output_dpi == 150
+    assert settings.last_annotation_color == "green"
+
+    document = json.loads(settings.path.read_text(encoding="utf-8"))
+    document.update(
+        {
+            "last_output_format": "gif",
+            "last_output_dpi": -1,
+            "last_annotation_color": "transparent",
+        }
+    )
+    settings.path.write_text(json.dumps(document), encoding="utf-8")
+    settings.reload()
+    assert settings.last_output_format == "png"
+    assert settings.last_output_dpi == 300
+    assert settings.last_annotation_color == "red"
 
     document = json.loads(settings.path.read_text(encoding="utf-8"))
     document["last_ratio"] = "99:1"

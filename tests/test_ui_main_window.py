@@ -58,6 +58,9 @@ class FakeSettings:
             "last_model_index": 0,
             "last_size_index": 0,
             "last_ratio": "1:1",
+            "last_output_format": "png",
+            "last_output_dpi": 300,
+            "last_annotation_color": "red",
             "confirm_requests": True,
             "today_gen": {"count": 0},
         }
@@ -88,6 +91,7 @@ class FakeImageService(QObject):
     text_only = Signal(str, str)
     cancelled = Signal(str)
     progress = Signal(str, int, int)
+    progress_stage = Signal(str, str, int, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -218,6 +222,62 @@ def test_visible_shared_parameters_are_dispatched_exactly_without_generation_pre
     service.cancel()
 
 
+def test_network_progress_shows_upload_generation_and_download_stages(
+    app: QApplication,
+) -> None:
+    window, _settings, service = _window()
+    window._prompt_edit.setPlainText("staged progress")
+    assert window.begin_generation()
+    job_id = service.current_job_id
+    assert job_id
+
+    service.progress_stage.emit(job_id, "uploading", 50, 100)
+    assert "上传请求 50%" in window._job_status_label.text()
+    service.progress_stage.emit(job_id, "generating", 0, -1)
+    assert "服务商正在生成" in window._job_status_label.text()
+    service.progress_stage.emit(job_id, "downloading", 75, 100)
+    assert "接收结果 75%" in window._job_status_label.text()
+    service.cancel()
+
+
+def test_output_controls_restore_persist_and_show_estimated_pixels(
+    app: QApplication,
+) -> None:
+    settings = FakeSettings()
+    settings.values.update(
+        {
+            "last_size_index": 1,
+            "last_ratio": "4:3",
+            "last_output_format": "jpeg",
+            "last_output_dpi": 150,
+            "last_annotation_color": "green",
+        }
+    )
+    window = MainWindow(settings, FakeImageService())
+
+    assert window._size_combo.currentText() == "2K"
+    assert window._selected_ratio() == "4:3"
+    assert window._selected_output_format() == "jpeg"
+    assert window._selected_output_dpi() == 150.0
+    assert window._selected_annotation_color() == "green"
+    assert window._preview.annotation_color == "green"
+    assert "2368 × 1776" in window._pixel_dimensions_label.text()
+
+    window._output_format_combo.setCurrentIndex(
+        window._output_format_combo.findData("png")
+    )
+    window._output_dpi_combo.setCurrentIndex(
+        window._output_dpi_combo.findData(96)
+    )
+    assert settings.values["last_output_format"] == "png"
+    assert settings.values["last_output_dpi"] == 96.0
+    window._annotation_color_combo.setCurrentIndex(
+        window._annotation_color_combo.findData("magenta")
+    )
+    assert settings.values["last_annotation_color"] == "magenta"
+    assert window._preview.annotation_color == "magenta"
+
+
 def test_default_sidebar_controls_fit_inside_horizontal_viewport(app: QApplication) -> None:
     window, _settings, _service = _window()
     window.resize(1510, 920)
@@ -226,10 +286,21 @@ def test_default_sidebar_controls_fit_inside_horizontal_viewport(app: QApplicati
     scroll = window.findChild(QScrollArea, "controlScroll")
     assert scroll is not None
     viewport = scroll.viewport()
-    for control in (window._preset_combo, window._model_combo, *window._ratio_group.buttons()):
+    for control in (
+        window._preset_combo,
+        window._model_combo,
+        window._output_format_combo,
+        window._output_dpi_combo,
+        *window._ratio_group.buttons(),
+    ):
         top_left = control.mapTo(viewport, QPoint(0, 0))
         assert top_left.x() >= 0
         assert top_left.x() + control.width() <= viewport.width()
+    window._set_ui_mode("edit")
+    _process(app)
+    top_left = window._annotation_color_combo.mapTo(viewport, QPoint(0, 0))
+    assert top_left.x() >= 0
+    assert top_left.x() + window._annotation_color_combo.width() <= viewport.width()
     window.close()
 
 
@@ -264,6 +335,9 @@ def test_edit_mandatory_preflight_sends_same_request_and_png_guide(
     window._edit_prompt.setPlainText("turn this area into polished gold")
     window._size_combo.setCurrentText("4K")
     next(button for button in window._ratio_group.buttons() if button.text() == "3:2").click()
+    window._annotation_color_combo.setCurrentIndex(
+        window._annotation_color_combo.findData("green")
+    )
 
     captured = []
 
@@ -276,11 +350,19 @@ def test_edit_mandatory_preflight_sends_same_request_and_png_guide(
     kind, kwargs = service.calls[-1]
     assert kind == "edit"
     assert kwargs["annotated_image"].startswith(b"\x89PNG\r\n\x1a\n")
+    assert kwargs["selection_mask"].startswith(b"\x89PNG\r\n\x1a\n")
+    mask = QImage.fromData(kwargs["selection_mask"])
+    assert mask.size() == QImage.fromData(source).size()
+    assert mask.pixelColor(mask.width() // 2, mask.height() // 2).red() == 255
+    assert mask.pixelColor(0, 0).red() == 0
+    assert kwargs["annotation_color"] == "green"
     assert kwargs["image_size"] == "4K"
     assert kwargs["aspect_ratio"] == "3:2"
     assert captured[0] is window._current_job.request
     assert captured[0].source_dpi == (144.0, 144.0)
     assert captured[0].wire_source_fmt == "png"
+    assert captured[0].selection_mask_bytes == kwargs["selection_mask"]
+    assert captured[0].annotation_color == "green"
     service.cancel()
 
 
@@ -322,6 +404,28 @@ def test_queue_freezes_preset_id_but_pairs_current_provider_with_latest_key(
     assert frozen.preset_id == "p1"
     assert kwargs["provider"] == "aihubmix"
     assert kwargs["api_key"] == "latest-aihubmix-key"
+    service.cancel()
+
+
+def test_queue_freezes_output_encoding_choices(app: QApplication) -> None:
+    window, _settings, service = _window()
+    window._output_format_combo.setCurrentIndex(
+        window._output_format_combo.findData("jpeg")
+    )
+    window._output_dpi_combo.setCurrentIndex(window._output_dpi_combo.findData(96))
+    window._prompt_edit.setPlainText("freeze jpeg at 96 dpi")
+    window._on_add_queue()
+
+    frozen = window._queue[0]
+    window._output_format_combo.setCurrentIndex(
+        window._output_format_combo.findData("png")
+    )
+    window._output_dpi_combo.setCurrentIndex(window._output_dpi_combo.findData(300))
+    window._on_start_queue()
+
+    request = window._current_job.request
+    assert frozen.output_format == request.requested_output_format == "jpeg"
+    assert frozen.output_dpi == request.requested_dpi == 96.0
     service.cancel()
 
 
@@ -450,6 +554,30 @@ def test_generation_embeds_300_dpi_for_every_size_without_rescaling(
     assert bool(route_messages) is (size == "4K")
 
 
+def test_generation_uses_selected_jpeg_and_dpi_without_rescaling(
+    app: QApplication,
+) -> None:
+    service = FakeImageService()
+    storage = FakeStorage()
+    window = MainWindow(FakeSettings(), service, storage)
+    window._output_format_combo.setCurrentIndex(
+        window._output_format_combo.findData("jpeg")
+    )
+    window._output_dpi_combo.setCurrentIndex(window._output_dpi_combo.findData(150))
+    window._prompt_edit.setPlainText("jpeg export")
+
+    assert window.begin_generation()
+    service.complete()
+
+    result = storage.generations[0]
+    assert result.request.requested_output_format == "jpeg"
+    assert result.request.requested_dpi == 150.0
+    assert result.fmt == "jpeg"
+    assert result.image_bytes.startswith(b"\xff\xd8\xff")
+    assert (result.width, result.height) == (32, 24)
+    assert result.output_dpi == (150.0, 150.0)
+
+
 @pytest.mark.parametrize("fmt", ["png", "jpeg", "webp", "bmp"])
 def test_generation_container_records_real_300_dpi_readback_and_dimensions(
     app: QApplication,
@@ -539,7 +667,7 @@ def test_generation_saves_and_reports_matching_json_sidecar(
     )
 
 
-def test_edit_reencodes_to_source_jpeg_at_300_dpi_and_uses_edit_save(
+def test_edit_reencodes_to_selected_jpeg_at_300_dpi_and_uses_edit_save(
     app: QApplication, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = FakeSettings()
@@ -549,6 +677,9 @@ def test_edit_reencodes_to_source_jpeg_at_300_dpi_and_uses_edit_save(
     source = image_bytes("JPEG", 80, 60)
     window._work_bytes = source
     window._work_fmt = "jpeg"
+    window._output_format_combo.setCurrentIndex(
+        window._output_format_combo.findData("jpeg")
+    )
     window._preview.set_image(source)
     canvas = window._preview.canvas
     canvas.set_tool("brush")
@@ -570,7 +701,7 @@ def test_edit_reencodes_to_source_jpeg_at_300_dpi_and_uses_edit_save(
     assert QImage.fromData(result.image_bytes).dotsPerMeterX() * 0.0254 == pytest.approx(300.0, abs=0.1)
 
 
-def test_webp_edit_reports_encoder_dpi_readback_instead_of_claiming_300(
+def test_webp_source_edit_uses_selected_png_output(
     app: QApplication,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -595,17 +726,11 @@ def test_webp_edit_reports_encoder_dpi_readback_instead_of_claiming_300(
     service.complete()
 
     result = storage.edits[0]
-    decoded = QImage.fromData(result.image_bytes)
-    actual = (
-        decoded.dotsPerMeterX() * 0.0254,
-        decoded.dotsPerMeterY() * 0.0254,
-    )
-    expected = tuple(
-        300.0 if abs(value - 300.0) <= 0.1 else round(value, 4)
-        for value in actual
-    )
-    assert result.fmt == "webp"
-    assert result.output_dpi == expected
+    assert result.request.source_fmt == "webp"
+    assert result.request.requested_output_format == "png"
+    assert result.fmt == "png"
+    assert result.image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    assert result.output_dpi == (300.0, 300.0)
 
 
 def test_import_is_immediately_archived_without_losing_work_image(
