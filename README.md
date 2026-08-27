@@ -14,8 +14,9 @@ AiHubMix 调用 Gemini 图像模型，完成文生图、局部标注编辑、串
 - 发送前原图/标注图/请求参数预检。
 - 串行生成队列、失败重试、连续失败三次暂停、请求取消。
 - 图片、模型文字说明、日志、保存路径与每日次数面板。
-- 多组 OpenRouter/AiHubMix API 预设和受密码保护的控制台。
+- 多组 OpenRouter/AiHubMix API 预设和受密码保护的控制台；验证后可掩码查看、显隐并复制所选密钥。
 - 自动保存图片及 JSON sidecar；API Key 使用 Windows DPAPI CurrentUser 加密。
+- 启动时自动居中并最大化；API 故障区分 HTTP 状态、DNS、TLS、超时和连接错误。
 - 单实例运行，避免两个进程并发覆盖设置与凭据。
 - 简体中文文案集中在语言目录，可注册其他 locale 并逐项回退中文。
 

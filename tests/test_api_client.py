@@ -288,6 +288,22 @@ def test_strict_status_base64_and_image_validation() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"choices":[{"error":{"message":"provider unavailable"}}]}',
+        'data: {"error":{"message":"provider unavailable"}}\n\ndata: [DONE]\n',
+    ],
+)
+def test_openrouter_embedded_choice_and_sse_errors_are_not_text_only(body: str) -> None:
+    with pytest.raises(ApiProtocolError, match="provider unavailable"):
+        ApiClient.parse_response(
+            provider="openrouter",
+            body=body,
+            status_code=200,
+        )
+
+
 def test_remote_url_requires_https_and_public_dns() -> None:
     def public_resolver(host, port, *, type):
         assert type == socket.SOCK_STREAM

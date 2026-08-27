@@ -2,6 +2,20 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.0.1] - 2026-08-27
+
+### Changed
+
+- 主窗口启动时自动居中并最大化，保留位于当前屏幕工作区内的还原位置。
+- 通过控制台密码验证后，可对所选预设的 API Key 进行掩码查看、显隐和复制。
+- 生成或编辑成功后同步保存同名 JSON sidecar，并在日志中显示其路径；保留旧版核心字段。
+
+### Fixed
+
+- 修复 Qt 将 OpenRouter HTTP 401/402/429/5xx 响应误报为普通网络故障的问题。
+- 网络错误现在区分服务商 HTTP 响应、DNS、TLS、超时、拒绝连接和连接中断，并在显示前清洗和脱敏详情。
+- 兼容 OpenRouter 在 HTTP 200 响应或 SSE 中返回的嵌入式 provider error，避免误判为文字-only 结果。
+
 ## [1.0.0] - 2026-08-26
 
 ### Added

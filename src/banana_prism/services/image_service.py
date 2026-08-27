@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from enum import Enum
@@ -26,6 +27,7 @@ from banana_prism.models import JobState
 from banana_prism.services.api_client import (
     ApiClient,
     ApiClientError,
+    ApiProtocolError,
     ApiRequest,
     ApiResult,
     UnsafeImageUrlError,
@@ -33,6 +35,10 @@ from banana_prism.services.api_client import (
     validate_image_bytes,
     validate_remote_image_url_syntax,
 )
+from banana_prism.services.log_service import redact_sensitive_text
+
+
+_API_ERROR_PREFIX = "BANANAPRISM_API_ERROR:"
 
 
 class TerminalState(str, Enum):
@@ -106,6 +112,7 @@ class ImageService(QObject):
         self._terminal_emitted = False
         self._parsed_result: ApiResult | None = None
         self._remote_original_url: str | None = None
+        self._ssl_error_detail = ""
 
         self._timeout = QTimer(self)
         self._timeout.setSingleShot(True)
@@ -136,6 +143,7 @@ class ImageService(QObject):
         self._terminal_emitted = False
         self._parsed_result = None
         self._remote_original_url = None
+        self._ssl_error_detail = ""
         self._set_state(JobState.RUNNING)
         if self._job_id != job_id:
             return StartResult(True, job_id)
@@ -211,7 +219,22 @@ class ImageService(QObject):
             )
         if hasattr(reply, "metaDataChanged"):
             reply.metaDataChanged.connect(lambda r=reply: self._metadata_changed(r))
+        if hasattr(reply, "sslErrors"):
+            reply.sslErrors.connect(
+                lambda errors, r=reply: self._remember_ssl_errors(r, errors)
+            )
         self._timeout.start(timeout_ms)
+
+    def _remember_ssl_errors(self, reply: Any, errors: Any) -> None:
+        if reply is not self._reply or self._job_id is None:
+            return
+        details: list[str] = []
+        for error in list(errors or ())[:3]:
+            try:
+                details.append(str(error.errorString()))
+            except (AttributeError, RuntimeError):
+                details.append(str(error))
+        self._ssl_error_detail = self._safe_error("; ".join(details))
 
     def _emit_progress(self, reply: Any, received: int, total: int) -> None:
         if reply is self._reply and self._job_id:
@@ -253,6 +276,9 @@ class ImageService(QObject):
         status_value = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         status = int(status_value) if status_value is not None else 0
         network_error = reply.error() if hasattr(reply, "error") else 0
+        network_detail = self._ssl_error_detail or (
+            reply.errorString() if hasattr(reply, "errorString") else ""
+        )
         stage = self._stage
         data = bytes(self._buffer)
 
@@ -270,9 +296,45 @@ class ImageService(QObject):
                 return
 
         self._release_reply(reply)
+
+        # Qt reports many HTTP 4xx/5xx replies as Content* network errors too.
+        # The HTTP response is the authoritative diagnosis whenever a status is
+        # available; checking reply.error() first used to hide useful 401/402/429
+        # provider messages behind a generic "network request failed" notice.
+        if stage == "api" and status and status != 200:
+            self._finish(
+                TerminalState.ERROR,
+                self._provider_error(
+                    "http",
+                    ApiClient._error_detail(data),
+                    status=status,
+                ),
+            )
+            return
+
+        if stage == "remote" and status and status != 200:
+            detail = ApiClient._error_detail(data)
+            suffix = f": {self._safe_error(detail)}" if detail else ""
+            self._finish(
+                TerminalState.ERROR,
+                f"Remote image returned HTTP {status}{suffix}",
+            )
+            return
+
         if network_error not in (0, QNetworkReply.NetworkError.NoError):
-            message = self._safe_error(reply.errorString())
-            self._finish(TerminalState.ERROR, f"Network request failed: {message}")
+            self._finish(
+                TerminalState.ERROR,
+                self._provider_error(
+                    self._network_error_category(network_error), network_detail
+                ),
+            )
+            return
+
+        if stage == "api" and not status:
+            self._finish(
+                TerminalState.ERROR,
+                self._provider_error("protocol", "No HTTP status was received"),
+            )
             return
 
         try:
@@ -300,7 +362,13 @@ class ImageService(QObject):
             else:
                 self._complete_remote_download(data, status, reply)
         except Exception as exc:
-            self._finish(TerminalState.ERROR, self._safe_error(exc))
+            if stage == "api" and isinstance(exc, ApiProtocolError):
+                self._finish(
+                    TerminalState.ERROR,
+                    self._provider_error("response", exc),
+                )
+            else:
+                self._finish(TerminalState.ERROR, self._safe_error(exc))
 
     def _begin_remote_download(self, url: str, redirect_count: int) -> None:
         if self._job_id is None:
@@ -392,7 +460,15 @@ class ImageService(QObject):
 
     def _on_timeout(self) -> None:
         if self._job_id is not None:
-            self._finish(TerminalState.ERROR, "Network request timed out")
+            timeout_ms = (
+                self._remote_timeout_ms
+                if self._stage in {"remote", "resolving"}
+                else self._request_timeout_ms
+            )
+            self._finish(
+                TerminalState.ERROR,
+                self._provider_error("timeout", timeout_ms=timeout_ms),
+            )
 
     def _release_reply(self, reply: Any) -> None:
         if reply is not self._reply:
@@ -406,6 +482,8 @@ class ImageService(QObject):
                 reply.downloadProgress.disconnect()
             if hasattr(reply, "metaDataChanged"):
                 reply.metaDataChanged.disconnect()
+            if hasattr(reply, "sslErrors"):
+                reply.sslErrors.disconnect()
         except (RuntimeError, TypeError):
             pass
         reply.deleteLater()
@@ -422,6 +500,7 @@ class ImageService(QObject):
         self._api_request = None
         self._parsed_result = None
         self._remote_original_url = None
+        self._ssl_error_detail = ""
         self._stage = ""
         self._job_id = None
         self._state = JobState.IDLE
@@ -434,6 +513,8 @@ class ImageService(QObject):
                     reply.downloadProgress.disconnect()
                 if hasattr(reply, "metaDataChanged"):
                     reply.metaDataChanged.disconnect()
+                if hasattr(reply, "sslErrors"):
+                    reply.sslErrors.disconnect()
             except (RuntimeError, TypeError):
                 pass
             try:
@@ -455,10 +536,82 @@ class ImageService(QObject):
             self.error.emit(job_id, str(payload or "Unknown error"))
         self.terminal.emit(job_id, terminal)
 
+    def _provider_error(
+        self,
+        category: str,
+        detail: Any = "",
+        *,
+        status: int = 0,
+        timeout_ms: int = 0,
+    ) -> str:
+        provider = (
+            self._api_request.provider.value if self._api_request is not None else "api"
+        )
+        payload: dict[str, Any] = {
+            "provider": provider,
+            "category": category,
+        }
+        cleaned = self._safe_error(detail) if str(detail).strip() else ""
+        if cleaned and cleaned != "Unknown error":
+            payload["detail"] = cleaned
+        if status:
+            payload["status"] = int(status)
+        if timeout_ms:
+            payload["timeout_ms"] = int(timeout_ms)
+        return _API_ERROR_PREFIX + json.dumps(
+            payload, ensure_ascii=True, separators=(",", ":")
+        )
+
     @staticmethod
-    def _safe_error(error: Any) -> str:
-        message = str(error).replace("\r", " ").replace("\n", " ").strip()
-        return message[:500] or "Unknown error"
+    def _network_error_category(error: Any) -> str:
+        if error in {
+            QNetworkReply.NetworkError.HostNotFoundError,
+            QNetworkReply.NetworkError.ProxyNotFoundError,
+        }:
+            return "dns"
+        if error == QNetworkReply.NetworkError.SslHandshakeFailedError:
+            return "tls"
+        if error in {
+            QNetworkReply.NetworkError.TimeoutError,
+            QNetworkReply.NetworkError.ProxyTimeoutError,
+        }:
+            return "timeout"
+        if error in {
+            QNetworkReply.NetworkError.ConnectionRefusedError,
+            QNetworkReply.NetworkError.ProxyConnectionRefusedError,
+        }:
+            return "refused"
+        if error in {
+            QNetworkReply.NetworkError.ProxyAuthenticationRequiredError,
+            QNetworkReply.NetworkError.AuthenticationRequiredError,
+        }:
+            return "authentication"
+        if error in {
+            QNetworkReply.NetworkError.RemoteHostClosedError,
+            QNetworkReply.NetworkError.TemporaryNetworkFailureError,
+            QNetworkReply.NetworkError.NetworkSessionFailedError,
+            QNetworkReply.NetworkError.ProxyConnectionClosedError,
+            QNetworkReply.NetworkError.OperationCanceledError,
+        }:
+            return "connection"
+        return "network"
+
+    def _safe_error(self, error: Any) -> str:
+        sensitive: list[str] = []
+        if self._api_request is not None:
+            for name, value in self._api_request.headers.items():
+                if name.casefold() in {
+                    "authorization",
+                    "x-goog-api-key",
+                    "api-key",
+                    "x-api-key",
+                }:
+                    sensitive.append(value)
+                    if value.casefold().startswith("bearer "):
+                        sensitive.append(value[7:].strip())
+        message = redact_sensitive_text(str(error), tuple(sensitive))
+        message = " ".join(message.replace("\x00", " ").split())
+        return message[:300] or "Unknown error"
 
 
 __all__ = ["ImageService", "JobState", "StartResult", "TerminalState"]

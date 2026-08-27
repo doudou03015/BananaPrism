@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QScrollArea
 from banana_prism.constants import MODELS
 from banana_prism import __version__
 from banana_prism.models import ApiPreset, QueueStatus
+from banana_prism.services.file_service import FileService
 from banana_prism.services.log_service import REDACTION, register_process_secret
 from banana_prism.ui.main_window import MainWindow
 
@@ -433,6 +434,32 @@ def test_generation_embeds_dpi_and_dispatches_concrete_auto_save(app: QApplicati
     assert decoded.dotsPerMeterX() * 0.0254 == pytest.approx(150.0, abs=0.1)
     assert result.saved_path == "D:\\saved\\generated.png" or result.saved_path == "D:/saved/generated.png"
     assert any("已保存" in message for _level, message in log.records)
+
+
+def test_generation_saves_and_reports_matching_json_sidecar(
+    app: QApplication, tmp_path: Path
+) -> None:
+    settings = FakeSettings()
+    service = FakeImageService()
+    storage = FileService(save_dir=tmp_path)
+    log = FakeLog()
+    window = MainWindow(settings, service, storage, log_service=log)
+    window._prompt_edit.setPlainText("legacy sidecar compatibility")
+
+    assert window.begin_generation()
+    service.complete(text="provider explanation")
+
+    assert window._last_result is not None
+    image_path = Path(window._last_result.saved_path or "")
+    sidecar_path = image_path.with_suffix(".json")
+    assert image_path.is_file()
+    assert sidecar_path.is_file()
+    assert image_path.stem == sidecar_path.stem
+    assert image_path.parent == sidecar_path.parent
+    assert any(
+        "参数 JSON 已同步保存" in message and str(sidecar_path) in message
+        for _level, message in log.records
+    )
 
 
 def test_edit_reencodes_to_source_jpeg_at_300_dpi_and_uses_edit_save(

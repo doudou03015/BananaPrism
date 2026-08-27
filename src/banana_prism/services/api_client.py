@@ -609,34 +609,70 @@ class ApiClient:
 
     @staticmethod
     def _error_detail(raw: bytes) -> str:
+        """Extract a bounded, single-line provider error without dumping payloads.
+
+        Error bodies are untrusted and sometimes contain an HTML gateway page.
+        Prefer the provider's structured message, then fall back to visible text;
+        credential redaction is applied by ``ImageService`` because it owns the
+        exact request credential.
+        """
+
+        value: Any = None
         try:
-            value = json.loads(raw.decode("utf-8", "replace"))
+            value = json.loads(raw[:16_384].decode("utf-8", "replace"))
             error = value.get("error") if isinstance(value, dict) else None
             if isinstance(error, dict):
-                value = error.get("message") or error.get("status") or ""
+                value = (
+                    error.get("message")
+                    or error.get("detail")
+                    or error.get("status")
+                    or ""
+                )
             elif error:
                 value = error
+            elif isinstance(value, dict):
+                value = value.get("message") or value.get("detail") or ""
             else:
                 value = ""
-            return str(value).replace("\r", " ").replace("\n", " ")[:500]
         except (ValueError, TypeError):
-            return ""
+            value = raw[:4_096].decode("utf-8", "replace")
+
+        text = re.sub(r"<[^>]{0,256}>", " ", str(value or ""))
+        text = " ".join(text.replace("\x00", " ").split())
+        return text[:300]
 
     @staticmethod
     def _raise_embedded_error(documents: Sequence[dict[str, Any]]) -> None:
         for document in documents:
             if document.get("error"):
-                error = document["error"]
-                if isinstance(error, dict):
-                    message = error.get("message") or error.get("status") or "Provider error"
-                else:
-                    message = error
-                raise ApiProtocolError(str(message)[:500])
+                raise ApiProtocolError(ApiClient._embedded_error_message(document["error"]))
+            # OpenRouter may return a provider failure on an individual choice
+            # even when the outer HTTP response is 200 (including an SSE chunk).
+            for collection_name in ("choices", "candidates"):
+                collection = document.get(collection_name)
+                if not isinstance(collection, list):
+                    continue
+                for item in collection:
+                    if isinstance(item, dict) and item.get("error"):
+                        raise ApiProtocolError(
+                            ApiClient._embedded_error_message(item["error"])
+                        )
             feedback = document.get("promptFeedback")
             if isinstance(feedback, dict) and feedback.get("blockReason"):
                 raise ApiProtocolError(
                     f"Provider blocked the prompt: {feedback['blockReason']}"
                 )
+
+    @staticmethod
+    def _embedded_error_message(error: Any) -> str:
+        if isinstance(error, dict):
+            error = (
+                error.get("message")
+                or error.get("detail")
+                or error.get("status")
+                or "Provider error"
+            )
+        return " ".join(str(error).replace("\x00", " ").split())[:500]
 
     @staticmethod
     def _choice_nodes(document: Mapping[str, Any]) -> Iterable[tuple[Mapping[str, Any], Mapping[str, Any]]]:

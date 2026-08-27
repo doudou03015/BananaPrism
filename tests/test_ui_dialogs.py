@@ -6,7 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox
 
 from banana_prism.models import ApiPreset, EditRequest, GenerationRequest
 from banana_prism.ui.dialogs.console_dialog import ConsoleDialog
@@ -83,6 +83,64 @@ def test_console_uses_secure_preset_contract_without_key_in_table(app: QApplicat
     )
     assert dialog.prompt_length_spin.minimum() == 10
     assert dialog.prompt_length_spin.maximum() == 100
+
+
+def test_console_reveals_and_copies_only_selected_decrypted_key(app: QApplication) -> None:
+    class CredentialSettings(ConsoleSettingsFake):
+        def __init__(self) -> None:
+            super().__init__()
+            self.values["active_preset_id"] = "configured"
+            self.presets = (
+                ApiPreset("configured", "Configured", "openrouter", "api:configured"),
+                ApiPreset("broken", "Broken", "aihubmix", "api:broken"),
+                ApiPreset("empty", "Empty", "openrouter", ""),
+            )
+            self.read_ids: list[str] = []
+
+        def get_api_key(self, preset_id: str) -> str | None:
+            self.read_ids.append(preset_id)
+            if preset_id == "configured":
+                return "test-key-kept-in-dpapi"
+            if preset_id == "broken":
+                raise OSError("simulated DPAPI failure")
+            return None
+
+    clipboard = QApplication.clipboard()
+    clipboard.clear()
+    settings = CredentialSettings()
+    dialog = ConsoleDialog(settings)
+
+    assert settings.read_ids and settings.read_ids[-1] == "configured"
+    assert dialog.api_key_view.text() == "test-key-kept-in-dpapi"
+    assert dialog.api_key_view.echoMode() == QLineEdit.EchoMode.Password
+    assert dialog.reveal_api_key_button.isEnabled()
+    assert dialog.copy_api_key_button.isEnabled()
+    assert "test-key-kept-in-dpapi" not in " ".join(
+        dialog.preset_table.item(0, column).text()
+        for column in range(dialog.preset_table.columnCount())
+    )
+
+    dialog.reveal_api_key_button.click()
+    assert dialog.api_key_view.echoMode() == QLineEdit.EchoMode.Normal
+    assert dialog.reveal_api_key_button.text() == "隐藏"
+    dialog.copy_api_key_button.click()
+    assert clipboard.text() == "test-key-kept-in-dpapi"
+    assert "已复制" in dialog.api_key_status.text()
+
+    dialog.preset_table.selectRow(1)
+    assert dialog.api_key_view.text() == ""
+    assert not dialog.reveal_api_key_button.isEnabled()
+    assert not dialog.copy_api_key_button.isEnabled()
+    assert "无法解密" in dialog.api_key_status.text()
+
+    dialog.preset_table.selectRow(2)
+    assert dialog.api_key_view.text() == ""
+    assert "尚未配置" in dialog.api_key_status.text()
+
+    dialog.preset_table.selectRow(0)
+    dialog.done(QDialog.DialogCode.Rejected)
+    assert dialog.api_key_view.text() == ""
+    clipboard.clear()
 
 
 def test_console_reports_grouped_settings_failure_without_claiming_success(

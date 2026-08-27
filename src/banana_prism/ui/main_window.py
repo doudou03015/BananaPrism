@@ -1705,6 +1705,12 @@ class MainWindow(QMainWindow):
                 self._set_saved_path(path)
                 self._source_label.setToolTip(path)
                 self._log("success", tr("main.save.succeeded", path=path))
+                sidecar_path = Path(path).with_suffix(".json")
+                if sidecar_path.is_file():
+                    self._log(
+                        "success",
+                        tr("main.save.sidecar_succeeded", path=sidecar_path),
+                    )
             return path
         return None
 

@@ -190,6 +190,50 @@ def _configure_qt_application(app: QApplication) -> None:
         app.setWindowIcon(QIcon(str(icon_path)))
 
 
+def _show_startup_window(window: MainWindow) -> None:
+    """Show the workspace maximized with a usable centered restore geometry.
+
+    ``MainWindow`` intentionally has a roomy desktop default size.  Fit that
+    size to the current screen's work area before maximizing so platforms that
+    ignore the maximize hint still show an accessible window, and restoring a
+    maximized window never brings it back partially off-screen.
+    """
+
+    # A real show (without yielding to the event loop) is required here rather
+    # than only forcing ``winId()``.  Qt's offscreen/minimal backends otherwise
+    # discard a move made before ``showMaximized()`` when the window is later
+    # restored.  Painting is still deferred, so production does not flash a
+    # normal window before the immediately following maximize request.
+    window.show()
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is not None:
+        available = screen.availableGeometry()
+        if available.isValid() and not available.isEmpty():
+            # Showing once creates the native handle before measuring the
+            # frame.  On Windows the title bar is otherwise absent from
+            # frameGeometry, leaving the restored window below true center.
+            initial_frame = window.frameGeometry()
+            frame_extra_width = max(0, initial_frame.width() - window.width())
+            frame_extra_height = max(0, initial_frame.height() - window.height())
+            window.resize(
+                min(window.width(), max(1, available.width() - frame_extra_width)),
+                min(window.height(), max(1, available.height() - frame_extra_height)),
+            )
+            frame = window.frameGeometry()
+            frame.moveCenter(available.center())
+
+            # If a minimum size exceeds a very small work area, keep the title
+            # bar at the visible top-left instead of centering it off-screen.
+            max_x = max(available.left(), available.right() - frame.width() + 1)
+            max_y = max(available.top(), available.bottom() - frame.height() + 1)
+            window.move(
+                min(max(frame.left(), available.left()), max_x),
+                min(max(frame.top(), available.top()), max_y),
+            )
+
+    window.showMaximized()
+
+
 def _report_startup_error(app: QApplication, message: str, *, headless: bool) -> None:
     safe_message = tr(
         "application.startup_failed.body",
@@ -277,7 +321,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     app.aboutToQuit.connect(services.close)
-    window.show()
+    _show_startup_window(window)
     if options.smoke_test:
         # Let queued signal connections, layout, icon loading, and service
         # construction all run at least once before a clean shutdown.

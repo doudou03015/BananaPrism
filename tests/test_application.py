@@ -15,6 +15,7 @@ from banana_prism.application import (
     INSTANCE_LOCK_FILENAME,
     SINGLE_INSTANCE_EXIT_CODE,
     SingleInstanceError,
+    _show_startup_window,
     build_services,
     create_main_window,
 )
@@ -46,6 +47,43 @@ def test_real_service_graph_uses_isolated_profile(
         window.close()
     finally:
         services.close()
+
+
+def test_startup_window_is_maximized_with_centered_restore_geometry(
+    app: QApplication,
+) -> None:
+    from PySide6.QtWidgets import QMainWindow
+
+    window = QMainWindow()
+    window.resize(600, 400)
+    screen = window.screen() or app.primaryScreen()
+    assert screen is not None
+    available = screen.availableGeometry()
+
+    _show_startup_window(window)
+    app.processEvents()
+
+    assert window.isVisible()
+    assert window.isMaximized()
+
+    # The pre-maximize geometry is the platform fallback and the geometry used
+    # when the user later restores the window.
+    window.showNormal()
+    app.processEvents()
+    restored = window.frameGeometry()
+    assert abs(restored.center().x() - available.center().x()) <= 2
+    assert abs(restored.center().y() - available.center().y()) <= 2
+    assert available.contains(restored)
+    window.close()
+
+    oversized = QMainWindow()
+    oversized.resize(available.width() + 300, available.height() + 300)
+    _show_startup_window(oversized)
+    app.processEvents()
+    oversized.showNormal()
+    app.processEvents()
+    assert available.contains(oversized.frameGeometry())
+    oversized.close()
 
 
 def test_injected_profile_never_probes_legacy_appdata(

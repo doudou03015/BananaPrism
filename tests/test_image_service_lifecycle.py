@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import json
 
+import pytest
 from PySide6.QtCore import QByteArray, QBuffer, QCoreApplication, QIODevice, QObject, QUrl, Signal
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtNetwork import QNetworkReply, QNetworkRequest
 
+from banana_prism.i18n import user_error_text
 from banana_prism.models import JobState
 from banana_prism.services.api_client import ApiClient
 from banana_prism.services.image_service import ImageService, TerminalState
@@ -27,6 +29,7 @@ class FakeReply(QObject):
     finished = Signal()
     downloadProgress = Signal(int, int)
     metaDataChanged = Signal()
+    sslErrors = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -34,6 +37,7 @@ class FakeReply(QObject):
         self._attributes = {}
         self._headers = {}
         self._error = QNetworkReply.NetworkError.NoError
+        self._error_string = "fake network error"
         self.aborted = False
 
     def readAll(self):
@@ -52,20 +56,34 @@ class FakeReply(QObject):
         return self._error
 
     def errorString(self):
-        return "fake network error"
+        return self._error_string
 
     def abort(self):
         self.aborted = True
         self.finished.emit()
 
-    def deliver(self, body: bytes, *, status: int = 200, headers=None, redirect=None):
+    def deliver(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        headers=None,
+        redirect=None,
+        error=QNetworkReply.NetworkError.NoError,
+        error_string: str = "fake network error",
+        ssl_errors=None,
+    ):
         self._body.extend(body)
         self._attributes[QNetworkRequest.Attribute.HttpStatusCodeAttribute] = status
+        self._error = error
+        self._error_string = error_string
         if redirect is not None:
             self._attributes[QNetworkRequest.Attribute.RedirectionTargetAttribute] = QUrl(redirect)
         for key, value in (headers or {}).items():
             self._headers[key.lower().encode("ascii")] = value.encode("ascii")
         self.metaDataChanged.emit()
+        if ssl_errors is not None:
+            self.sslErrors.emit(ssl_errors)
         self.readyRead.emit()
         self.finished.emit()
 
@@ -91,9 +109,9 @@ def app() -> QCoreApplication:
     return QCoreApplication.instance() or QCoreApplication([])
 
 
-def request():
+def request(provider: str = "openrouter"):
     return ApiClient.build_generation_request(
-        provider="openrouter",
+        provider=provider,
         api_key="test-key",
         model_id="google/current-ga-image",
         prompt="test",
@@ -156,7 +174,10 @@ def test_timeout_and_cancel_both_allow_an_immediate_restart() -> None:
 
     timed_out = service.start(request())
     service._on_timeout()
-    assert errors == [(timed_out.job_id, "Network request timed out")]
+    assert errors[0][0] == timed_out.job_id
+    assert user_error_text(errors[0][1]) == (
+        "OpenRouter 请求超时（300 秒），请稍后重试或检查代理与网络稳定性。"
+    )
     assert terminals == [(timed_out.job_id, TerminalState.ERROR)]
     assert service.state is JobState.IDLE
 
@@ -221,10 +242,99 @@ def test_text_only_and_http_error_terminal_paths() -> None:
 
     second = service.start(request())
     manager.posts[-1][2].deliver(
-        b'{"error":{"message":"rejected"}}', status=429
+        b'{"error":{"message":"rejected"}}',
+        status=429,
+        error=QNetworkReply.NetworkError.ContentAccessDenied,
     )
     assert error_events and error_events[-1][0] == second.job_id
-    assert "HTTP 429" in error_events[-1][1]
+    assert user_error_text(error_events[-1][1]) == "OpenRouter 返回 HTTP 429：rejected"
+
+
+@pytest.mark.parametrize(
+    ("network_error", "error_string", "expected"),
+    [
+        (
+            QNetworkReply.NetworkError.HostNotFoundError,
+            "Host openrouter.ai not found",
+            "OpenRouter DNS 解析失败",
+        ),
+        (
+            QNetworkReply.NetworkError.SslHandshakeFailedError,
+            "SSL handshake failed",
+            "OpenRouter TLS/SSL 握手失败",
+        ),
+        (
+            QNetworkReply.NetworkError.TimeoutError,
+            "Connection timed out",
+            "OpenRouter 请求超时",
+        ),
+        (
+            QNetworkReply.NetworkError.ConnectionRefusedError,
+            "Connection refused",
+            "OpenRouter 连接被拒绝",
+        ),
+        (
+            QNetworkReply.NetworkError.RemoteHostClosedError,
+            "Remote host closed the connection",
+            "OpenRouter 连接中断",
+        ),
+    ],
+)
+def test_network_errors_keep_provider_and_actionable_category(
+    network_error, error_string: str, expected: str
+) -> None:
+    app()
+    manager = FakeManager()
+    service = ImageService(network_manager=manager)
+    errors = []
+    service.error.connect(lambda job, message: errors.append((job, message)))
+
+    started = service.start(request())
+    manager.posts[-1][2].deliver(
+        b"",
+        status=0,
+        error=network_error,
+        error_string=error_string,
+    )
+
+    assert errors[0][0] == started.job_id
+    display = user_error_text(errors[0][1])
+    assert expected in display
+    assert error_string in display or network_error == QNetworkReply.NetworkError.TimeoutError
+
+
+def test_ssl_signal_detail_and_http_error_body_are_sanitized() -> None:
+    class FakeSslError:
+        def errorString(self) -> str:
+            return "certificate expired for api.openrouter.test"
+
+    app()
+    manager = FakeManager()
+    service = ImageService(network_manager=manager)
+    errors = []
+    service.error.connect(lambda job, message: errors.append(message))
+
+    service.start(request())
+    manager.posts[-1][2].deliver(
+        b"",
+        status=0,
+        error=QNetworkReply.NetworkError.SslHandshakeFailedError,
+        error_string="generic TLS failure",
+        ssl_errors=[FakeSslError()],
+    )
+    assert "certificate expired" in user_error_text(errors[-1])
+
+    service.start(request())
+    manager.posts[-1][2].deliver(
+        b'{"error":{"message":"quota denied; echoed test-key\\r\\nretry"}}',
+        status=402,
+        error=QNetworkReply.NetworkError.ContentAccessDenied,
+    )
+    display = user_error_text(errors[-1])
+    assert display.startswith("OpenRouter 返回 HTTP 402：quota denied")
+    assert "test-key" not in errors[-1]
+    assert "[REDACTED]" in display
+    assert "\n" not in display and "\r" not in display
 
 
 def test_remote_download_is_pinned_and_private_redirect_is_rejected() -> None:

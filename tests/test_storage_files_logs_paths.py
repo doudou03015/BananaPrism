@@ -134,6 +134,25 @@ def test_image_and_sidecar_commit_include_integrity_and_provenance(tmp_path: Pat
     assert metadata["token_usage"] == {"input_tokens": 12, "output_tokens": 3}
     assert result.saved_path == str(image_path)
 
+    # Keep the original NanaBananaStudio generation-sidecar contract while
+    # retaining BananaPrism's additional provenance and integrity fields.
+    legacy_fields = {
+        "mode",
+        "model",
+        "model_short",
+        "size",
+        "ratio",
+        "prompt",
+        "text_content",
+        "fmt",
+        "width",
+        "height",
+        "timestamp",
+    }
+    assert legacy_fields <= metadata.keys()
+    assert metadata["mode"] == "txt2img"
+    assert metadata["fmt"] == "png"
+
     second_path = service.auto_save(generation_result())
     assert second_path != image_path
     assert second_path.stem.endswith("_1")

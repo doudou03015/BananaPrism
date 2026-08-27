@@ -10,7 +10,9 @@ Password operations use the separately injected ``AuthService`` with
 ``has_password()``, ``verify_password()`` and ``set_password()``.
 
 Aliases used by older builds are accepted.  Credentials are passed directly to
-the service and are never retained in the table model or written to logs.
+the service and are never retained in the table model or written to logs.  An
+authenticated console may decrypt the selected credential into a short-lived,
+masked line edit so the user can reveal or copy it explicitly.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from PySide6.QtCore import QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -134,6 +137,30 @@ class ConsoleDialog(QDialog):
         self.preset_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.preset_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.preset_table.doubleClicked.connect(self._edit_preset)
+        self.preset_table.currentCellChanged.connect(self._selected_preset_changed)
+
+        self.api_key_view = QLineEdit()
+        self.api_key_view.setObjectName("selectedApiKeyView")
+        self.api_key_view.setReadOnly(True)
+        self.api_key_view.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key_view.setPlaceholderText(tr("console.api.select_preset"))
+        self.reveal_api_key_button = QPushButton(tr("console.api.show"))
+        self.reveal_api_key_button.setObjectName("revealApiKeyButton")
+        self.reveal_api_key_button.setCheckable(True)
+        self.reveal_api_key_button.setEnabled(False)
+        self.reveal_api_key_button.toggled.connect(self._set_api_key_visible)
+        self.copy_api_key_button = QPushButton(tr("common.copy"))
+        self.copy_api_key_button.setObjectName("copyApiKeyButton")
+        self.copy_api_key_button.setEnabled(False)
+        self.copy_api_key_button.clicked.connect(self._copy_api_key)
+        credential_row = QHBoxLayout()
+        credential_row.addWidget(self.api_key_view, 1)
+        credential_row.addWidget(self.reveal_api_key_button)
+        credential_row.addWidget(self.copy_api_key_button)
+        self.api_key_status = QLabel(tr("console.api.select_preset"))
+        self.api_key_status.setObjectName("selectedApiKeyStatus")
+        self.api_key_status.setWordWrap(True)
+        self.api_key_status.setProperty("hint", True)
 
         add_button = QPushButton(tr("console.button.add"))
         add_button.setObjectName("addPresetButton")
@@ -162,6 +189,9 @@ class ConsoleDialog(QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.addWidget(QLabel(tr("console.presets.note")))
         layout.addWidget(self.preset_table, 1)
+        layout.addWidget(QLabel(tr("console.api.selected_key")))
+        layout.addLayout(credential_row)
+        layout.addWidget(self.api_key_status)
         layout.addLayout(actions)
         layout.addLayout(password_row)
         return tab
@@ -375,7 +405,10 @@ class ConsoleDialog(QDialog):
         return self._active_id
 
     def _refresh_table(self) -> None:
+        selected_id = self._selected_preset().preset_id if self._selected_preset() else self._active_id
+        self._clear_api_key_display(tr("console.api.select_preset"))
         self.preset_table.setRowCount(len(self._presets))
+        selected_row = -1
         for row, preset in enumerate(self._presets):
             provider = API_PROVIDERS.get(preset.provider)
             values = (
@@ -392,6 +425,12 @@ class ConsoleDialog(QDialog):
                 if column == 0:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.preset_table.setItem(row, column, item)
+            if preset.preset_id == selected_id:
+                selected_row = row
+        if selected_row < 0 and self._presets:
+            selected_row = 0
+        if selected_row >= 0:
+            self.preset_table.selectRow(selected_row)
 
     def _selected_preset(self) -> ApiPreset | None:
         row = self.preset_table.currentRow()
@@ -403,6 +442,60 @@ class ConsoleDialog(QDialog):
             (((preset.credential_ref,), {}), ((preset.preset_id,), {})),
         )
         return bool(result) if result is not None else bool(preset.credential_ref)
+
+    def _clear_api_key_display(self, status: str) -> None:
+        self.reveal_api_key_button.setChecked(False)
+        self.api_key_view.clear()
+        self.api_key_view.setEchoMode(QLineEdit.EchoMode.Password)
+        self.reveal_api_key_button.setText(tr("console.api.show"))
+        self.reveal_api_key_button.setEnabled(False)
+        self.copy_api_key_button.setEnabled(False)
+        self.api_key_status.setText(status)
+
+    def _selected_preset_changed(self, *_args: Any) -> None:
+        preset = self._selected_preset()
+        self._clear_api_key_display(tr("console.api.select_preset"))
+        if preset is None:
+            return
+        method = getattr(self._settings, "get_api_key", None) if self._settings is not None else None
+        if not callable(method):
+            self.api_key_status.setText(tr("console.api.read_unavailable"))
+            return
+        try:
+            value = method(preset.preset_id)
+        except Exception:
+            # Do not expose provider/DPAPI diagnostics here: they may contain
+            # sensitive context and selection should remain non-disruptive.
+            self.api_key_status.setText(tr("console.api.decrypt_failed"))
+            return
+        api_key = value if isinstance(value, str) else ""
+        if not api_key:
+            self.api_key_status.setText(tr("console.api.not_configured"))
+            return
+        self.api_key_view.setText(api_key)
+        self.reveal_api_key_button.setEnabled(True)
+        self.copy_api_key_button.setEnabled(True)
+        self.api_key_status.setText(tr("console.api.loaded_masked"))
+
+    def _set_api_key_visible(self, visible: bool) -> None:
+        self.api_key_view.setEchoMode(
+            QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        )
+        self.reveal_api_key_button.setText(
+            tr("console.api.hide" if visible else "console.api.show")
+        )
+
+    def _copy_api_key(self) -> None:
+        api_key = self.api_key_view.text()
+        if not api_key:
+            return
+        QApplication.clipboard().setText(api_key)
+        self.api_key_status.setText(tr("console.api.copied"))
+
+    def done(self, result: int) -> None:
+        # Limit the plaintext lifetime to this authenticated console session.
+        self._clear_api_key_display("")
+        super().done(result)
 
     def _add_preset(self) -> None:
         dialog = ApiPresetDialog(self)

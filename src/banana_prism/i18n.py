@@ -7,6 +7,7 @@ locales can be registered without changing widget code; an installed Qt
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -68,6 +69,33 @@ _ZH_CN = {
     "error.api.http": "API 返回 HTTP {status}，请求未完成。",
     "error.api.network": "网络请求失败，请检查连接和服务商状态。",
     "error.api.timeout": "网络请求超时，请稍后重试。",
+    "error.api.provider_http": "{provider} 返回 HTTP {status}：{detail}",
+    "error.api.provider_http_empty": "{provider} 返回 HTTP {status}，请求未完成。",
+    "error.api.provider_dns": (
+        "{provider} DNS 解析失败，请检查网络、DNS 和服务商接口地址。{detail}"
+    ),
+    "error.api.provider_tls": (
+        "{provider} TLS/SSL 握手失败，请检查系统时间、代理和证书链。{detail}"
+    ),
+    "error.api.provider_timeout": (
+        "{provider} 请求超时{duration}，请稍后重试或检查代理与网络稳定性。"
+    ),
+    "error.api.provider_refused": (
+        "{provider} 连接被拒绝，请检查代理、防火墙和服务商状态。{detail}"
+    ),
+    "error.api.provider_connection": (
+        "{provider} 连接中断，请检查代理和网络稳定性后重试。{detail}"
+    ),
+    "error.api.provider_authentication": (
+        "{provider} 身份验证失败，请检查 API Key 或代理认证。{detail}"
+    ),
+    "error.api.provider_network": (
+        "{provider} 网络请求失败，请检查连接和服务商状态。{detail}"
+    ),
+    "error.api.provider_protocol": (
+        "{provider} 未返回有效的 HTTP 响应，请检查代理和接口地址。{detail}"
+    ),
+    "error.api.provider_response": "{provider} 返回的响应无效或请求被拒绝。{detail}",
     "error.api.no_result": "服务商既未返回图片，也未返回文字。",
     "error.image.invalid": "图片数据无效、格式不受支持或超出安全限制。",
     "error.image.remote_unsafe": "远程图片地址不安全，已拒绝访问。",
@@ -174,6 +202,15 @@ _ZH_CN = {
     "console.password.note": "控制台密码保护 API 配置",
     "console.password.change": "修改控制台密码",
     "console.presets.note": "切换服务商和 API Key；队列任务会保留入队时的预设快照。",
+    "console.api.selected_key": "所选预设的 API Key",
+    "console.api.select_preset": "请选择一个 API 预设。",
+    "console.api.show": "显示",
+    "console.api.hide": "隐藏",
+    "console.api.read_unavailable": "设置服务不支持读取 API Key。",
+    "console.api.decrypt_failed": "无法解密此 API Key，请在当前 Windows 用户下重新保存。",
+    "console.api.not_configured": "此预设尚未配置 API Key。",
+    "console.api.loaded_masked": "API Key 已从 Windows 安全存储读取，默认隐藏。",
+    "console.api.copied": "API Key 已复制到系统剪贴板，请使用后覆盖剪贴板内容。",
     "console.statistics.zero": "0",
     "console.statistics.caption": "今日成功生成 / 编辑",
     "console.statistics.refresh": "刷新统计",
@@ -320,6 +357,7 @@ _ZH_CN = {
     "main.import.succeeded": "已导入工作图：{name}",
     "main.save.auto_failed": "自动保存失败：{error}",
     "main.save.succeeded": "已保存：{path}",
+    "main.save.sidecar_succeeded": "参数 JSON 已同步保存：{path}",
     "main.import.archive_failed": "导入图归档失败：{error}",
     "main.import.archived": "导入图已归档：{path}",
     "main.directory.missing.title": "目录不存在",
@@ -406,6 +444,55 @@ def tr(key: str, /, **values: object) -> str:
 
 _HAN_TEXT = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _HTTP_STATUS = re.compile(r"(?:API returned|Remote image returned) HTTP\s+(\d{3})", re.I)
+_API_ERROR_PREFIX = "BANANAPRISM_API_ERROR:"
+
+
+def _provider_diagnostic_text(detail: str) -> str | None:
+    if not detail.startswith(_API_ERROR_PREFIX):
+        return None
+    try:
+        payload = json.loads(detail[len(_API_ERROR_PREFIX) :])
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    provider = {
+        "openrouter": "OpenRouter",
+        "aihubmix": "AiHubMix",
+    }.get(str(payload.get("provider", "")).casefold(), "API 服务商")
+    category = str(payload.get("category", "network")).casefold()
+    raw_detail = " ".join(str(payload.get("detail", "")).split())[:300]
+    detail_suffix = f" 详情：{raw_detail}" if raw_detail else ""
+
+    if category == "http":
+        try:
+            status = int(payload.get("status", 0))
+        except (TypeError, ValueError):
+            status = 0
+        if not 100 <= status <= 599:
+            status = 0
+        key = "error.api.provider_http" if raw_detail else "error.api.provider_http_empty"
+        return tr(key, provider=provider, status=status or "未知", detail=raw_detail)
+    if category == "timeout":
+        try:
+            timeout_ms = max(0, int(payload.get("timeout_ms", 0)))
+        except (TypeError, ValueError):
+            timeout_ms = 0
+        duration = f"（{timeout_ms / 1000:g} 秒）" if timeout_ms else ""
+        return tr("error.api.provider_timeout", provider=provider, duration=duration)
+
+    key = {
+        "dns": "error.api.provider_dns",
+        "tls": "error.api.provider_tls",
+        "refused": "error.api.provider_refused",
+        "connection": "error.api.provider_connection",
+        "authentication": "error.api.provider_authentication",
+        "protocol": "error.api.provider_protocol",
+        "response": "error.api.provider_response",
+        "network": "error.api.provider_network",
+    }.get(category, "error.api.provider_network")
+    return tr(key, provider=provider, detail=detail_suffix)
 
 
 def user_error_text(error: BaseException | object) -> str:
@@ -417,6 +504,9 @@ def user_error_text(error: BaseException | object) -> str:
     """
 
     detail = str(error).strip()
+    provider_diagnostic = _provider_diagnostic_text(detail)
+    if provider_diagnostic is not None:
+        return provider_diagnostic
     if detail and _HAN_TEXT.search(detail):
         return detail
     match = _HTTP_STATUS.search(detail)
