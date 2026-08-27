@@ -16,6 +16,10 @@ AiHubMix 调用 Gemini 图像模型，完成文生图、局部标注编辑、串
 - 图片、模型文字说明、日志、保存路径与每日次数面板。
 - 多组 OpenRouter/AiHubMix API 预设和受密码保护的控制台；验证后可掩码查看、显隐并复制所选密钥。
 - 自动保存图片及 JSON sidecar；API Key 使用 Windows DPAPI CurrentUser 加密。
+- 生成和编辑结果统一尝试写入 300 DPI 元数据，不改变服务商返回的像素尺寸；
+  若图片容器未保留 300 DPI，日志会提示并在 JSON sidecar 中记录真实回读值。
+- OpenRouter 的 4K 生成与编辑使用官方 Images API，不替换 Preview 模型、不降低分辨率；
+  该接口只返回图片，因此 4K 结果通常没有模型文字说明。
 - 启动时自动居中并最大化；API 故障区分 HTTP 状态、DNS、TLS、超时和连接错误。
 - 单实例运行，避免两个进程并发覆盖设置与凭据。
 - 简体中文文案集中在语言目录，可注册其他 locale 并逐项回退中文。

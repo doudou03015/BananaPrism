@@ -67,11 +67,10 @@ from banana_prism.constants import (
     API_PROVIDERS,
     DEFAULT_BRUSH_RADIUS,
     DEFAULT_RATIO,
-    EDIT_OUTPUT_DPI,
     MODELS,
+    OUTPUT_DPI,
     RATIOS,
     SIZES,
-    T2I_DPI_BY_SIZE,
 )
 from banana_prism import __version__
 from banana_prism.i18n import tr, user_error_text
@@ -1005,6 +1004,8 @@ class MainWindow(QMainWindow):
                 ratio=context.request.ratio,
             ),
         )
+        if context.preset.provider == "openrouter" and context.request.size == "4K":
+            self._log("info", tr("main.job.openrouter_images_api"))
         accepted, job_id, reason = (
             self._dispatch_generation(context, api_key)
             if context.kind == "generation"
@@ -1059,18 +1060,17 @@ class MainWindow(QMainWindow):
         if isinstance(payload, (GenerationResult, EditResult)):
             payload.text_content = redact_for_display(payload.text_content)
             if context.kind == "generation" and isinstance(payload, GenerationResult):
-                dpi = T2I_DPI_BY_SIZE.get(context.request.size)
-                return (
-                    self._apply_output_encoding(payload, dpi=dpi, target_fmt=payload.fmt)
-                    if dpi
-                    else payload
+                return self._apply_output_encoding(
+                    payload,
+                    dpi=OUTPUT_DPI,
+                    target_fmt=payload.fmt,
                 )
             if context.kind == "edit" and isinstance(payload, EditResult):
                 request = context.request
                 assert isinstance(request, EditRequest)
                 return self._apply_output_encoding(
                     payload,
-                    dpi=EDIT_OUTPUT_DPI,
+                    dpi=OUTPUT_DPI,
                     target_fmt=request.source_fmt,
                     jpeg_quality=95,
                 )
@@ -1098,12 +1098,15 @@ class MainWindow(QMainWindow):
         if context.kind == "generation":
             request = context.request
             assert isinstance(request, GenerationRequest)
-            dpi = T2I_DPI_BY_SIZE.get(request.size)
             result = GenerationResult(
                 bytes(data), str(fmt), width, height, request, text_content=text,
                 usage=usage,
             )
-            return self._apply_output_encoding(result, dpi=dpi, target_fmt=str(fmt)) if dpi else result
+            return self._apply_output_encoding(
+                result,
+                dpi=OUTPUT_DPI,
+                target_fmt=str(fmt),
+            )
         request = context.request
         assert isinstance(request, EditRequest)
         result = EditResult(
@@ -1112,7 +1115,7 @@ class MainWindow(QMainWindow):
         )
         return self._apply_output_encoding(
             result,
-            dpi=EDIT_OUTPUT_DPI,
+            dpi=OUTPUT_DPI,
             target_fmt=request.source_fmt,
             jpeg_quality=95,
         )
@@ -1205,6 +1208,14 @@ class MainWindow(QMainWindow):
         )
         if not all(value > 0 for value in actual_dpi):
             readback_dpi: tuple[float, float] | None = None
+            self._log(
+                "warn",
+                tr(
+                    "main.encode.dpi_missing",
+                    format=fmt.upper(),
+                    requested=float(dpi),
+                ),
+            )
         elif all(abs(value - float(dpi)) <= 0.1 for value in actual_dpi):
             # Dots-per-metre is integral, so nominal 300 DPI commonly reads
             # back as 299.9994.  Preserve the requested nominal value only

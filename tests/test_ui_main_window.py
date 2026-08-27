@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +15,12 @@ from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QScrollArea
 
 from banana_prism.constants import MODELS
 from banana_prism import __version__
-from banana_prism.models import ApiPreset, QueueStatus
+from banana_prism.models import (
+    ApiPreset,
+    GenerationRequest,
+    GenerationResult,
+    QueueStatus,
+)
 from banana_prism.services.file_service import FileService
 from banana_prism.services.log_service import REDACTION, register_process_secret
 from banana_prism.ui.main_window import MainWindow
@@ -416,24 +422,95 @@ def test_close_cancels_active_job_before_later_close(app: QApplication, monkeypa
     assert window._close_confirmed
 
 
-def test_generation_embeds_dpi_and_dispatches_concrete_auto_save(app: QApplication) -> None:
+@pytest.mark.parametrize("size", ["1K", "2K", "4K"])
+def test_generation_embeds_300_dpi_for_every_size_without_rescaling(
+    app: QApplication,
+    size: str,
+) -> None:
     settings = FakeSettings()
     service = FakeImageService()
     storage = FakeStorage()
     log = FakeLog()
     window = MainWindow(settings, service, storage, log_service=log)
-    window._size_combo.setCurrentText("2K")
+    window._size_combo.setCurrentText(size)
     window._prompt_edit.setPlainText("dpi test")
     assert window.begin_generation()
     service.complete()
 
     assert len(storage.generations) == 1
     result = storage.generations[0]
-    assert result.output_dpi == (150.0, 150.0)
+    assert result.request.size == size
+    assert result.output_dpi == (300.0, 300.0)
     decoded = QImage.fromData(result.image_bytes)
-    assert decoded.dotsPerMeterX() * 0.0254 == pytest.approx(150.0, abs=0.1)
+    assert (decoded.width(), decoded.height()) == (32, 24)
+    assert decoded.dotsPerMeterX() * 0.0254 == pytest.approx(300.0, abs=0.1)
     assert result.saved_path == "D:\\saved\\generated.png" or result.saved_path == "D:/saved/generated.png"
     assert any("已保存" in message for _level, message in log.records)
+    route_messages = [message for _level, message in log.records if "Images API" in message]
+    assert bool(route_messages) is (size == "4K")
+
+
+@pytest.mark.parametrize("fmt", ["png", "jpeg", "webp", "bmp"])
+def test_generation_container_records_real_300_dpi_readback_and_dimensions(
+    app: QApplication,
+    tmp_path: Path,
+    fmt: str,
+) -> None:
+    log = FakeLog()
+    window = MainWindow(
+        FakeSettings(),
+        FakeImageService(),
+        FakeStorage(),
+        log_service=log,
+    )
+    request = GenerationRequest(
+        prompt="container dpi",
+        model_id="google/gemini-test-image",
+        model_short_name="NanoBanana",
+        size="1K",
+        ratio="4:3",
+        preset_id="p1",
+        provider="openrouter",
+    )
+    result = GenerationResult(
+        image_bytes=image_bytes(fmt, 71, 53),
+        fmt=fmt,
+        width=71,
+        height=53,
+        request=request,
+    )
+
+    encoded = window._apply_output_encoding(
+        result,
+        dpi=300.0,
+        target_fmt=fmt,
+        jpeg_quality=95,
+    )
+    image_path = FileService(save_dir=tmp_path / fmt).auto_save(encoded)
+    persisted = QImage.fromData(image_path.read_bytes())
+    metadata = json.loads(
+        image_path.with_suffix(".json").read_text(encoding="utf-8")
+    )
+
+    assert not persisted.isNull()
+    assert (persisted.width(), persisted.height()) == (71, 53)
+    actual = (
+        persisted.dotsPerMeterX() * 0.0254,
+        persisted.dotsPerMeterY() * 0.0254,
+    )
+    if all(value > 0 for value in actual):
+        expected = tuple(
+            300.0 if abs(value - 300.0) <= 0.1 else round(value, 4)
+            for value in actual
+        )
+        assert encoded.output_dpi == expected
+        assert metadata["output_dpi"] == list(expected)
+        if expected != (300.0, 300.0):
+            assert any("按回读值" in message for _level, message in log.records)
+    else:
+        assert encoded.output_dpi is None
+        assert metadata["output_dpi"] is None
+        assert any("编码回读没有有效 DPI" in message for _level, message in log.records)
 
 
 def test_generation_saves_and_reports_matching_json_sidecar(

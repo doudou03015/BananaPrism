@@ -2,6 +2,19 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.0.2] - 2026-08-27
+
+### Changed
+
+- OpenRouter 4K 使用官方专用 Images API，保留正式模型 ID 与所选比例；1K/2K 继续使用 Chat Completions。
+- 1K、2K、4K 生成结果与编辑结果统一尝试写入 300 DPI 元数据，不改变像素尺寸；
+  容器不支持时记录真实回读值并提示。
+
+### Fixed
+
+- 修复 `google/gemini-3.1-flash-image` 经 Chat Completions 请求 4K 时被当前后端以 HTTP 400 拒绝的问题。
+- 兼容 Images API 的 `data[].b64_json` 响应与两张有序编辑参考图。
+
 ## [1.0.1] - 2026-08-27
 
 ### Changed

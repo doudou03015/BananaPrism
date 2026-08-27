@@ -93,8 +93,7 @@ ZOOM_MAX = 10.0
 ZOOM_STEP = 0.15
 ANNOTATION_COLOR = (245, 213, 71, 120)
 ANNOTATION_BORDER_COLOR = (245, 213, 71, 255)
-T2I_DPI_BY_SIZE = {"2K": 150.0, "4K": 300.0}
-EDIT_OUTPUT_DPI = 300.0
+OUTPUT_DPI = 300.0
 EDIT_ANNOTATION_LABEL = "Annotated image (banana-yellow = region to edit):"
 
 EDIT_SYSTEM_PROMPT = """You are a precise, non-destructive image editor.

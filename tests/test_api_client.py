@@ -41,28 +41,78 @@ def data_uri(data: bytes) -> str:
     return "data:image/png;base64," + base64.b64encode(data).decode("ascii")
 
 
-def test_openrouter_generation_payload_is_exact() -> None:
+@pytest.mark.parametrize("image_size", ["1K", "2K"])
+def test_openrouter_generation_payload_is_exact(image_size: str) -> None:
     request = ApiClient.build_generation_request(
         provider="openrouter",
         api_key="secret-for-test",
         model_id="google/current-ga-image-model",
         prompt="a prism",
-        image_size="2K",
+        image_size=image_size,
         aspect_ratio="16:9",
     )
     assert request.url == "https://openrouter.ai/api/v1/chat/completions"
     assert request.headers == {
         "Authorization": "Bearer secret-for-test",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://banana-prism.local",
-        "X-Title": "BananaPrism",
+        "HTTP-Referer": "https://github.com/doudou03015/BananaPrism",
+        "X-OpenRouter-Title": "BananaPrism",
     }
     assert request.payload == {
         "model": "google/current-ga-image-model",
         "modalities": ["image", "text"],
         "messages": [{"role": "user", "content": "a prism"}],
-        "image_config": {"aspect_ratio": "16:9", "image_size": "2K"},
+        "image_config": {"aspect_ratio": "16:9", "image_size": image_size},
     }
+
+
+def test_openrouter_4k_uses_dedicated_images_api_without_model_swap_or_downgrade() -> None:
+    request = ApiClient.build_generation_request(
+        provider="openrouter",
+        api_key="secret-for-test",
+        model_id="google/gemini-3.1-flash-image",
+        prompt="a 4K prism",
+        image_size="4K",
+        aspect_ratio="4:3",
+    )
+
+    assert request.url == "https://openrouter.ai/api/v1/images"
+    assert request.payload == {
+        "model": "google/gemini-3.1-flash-image",
+        "prompt": "a 4K prism",
+        "resolution": "4K",
+        "aspect_ratio": "4:3",
+        "n": 1,
+    }
+    assert "messages" not in request.payload
+    assert "image_config" not in request.payload
+
+
+def test_openrouter_4k_custom_chat_endpoint_stays_on_the_same_origin() -> None:
+    request = ApiClient.build_generation_request(
+        provider="openrouter",
+        api_key="proxy-key-for-test",
+        model_id="google/gemini-3-pro-image",
+        prompt="a prism",
+        image_size="4K",
+        aspect_ratio="1:1",
+        api_url="https://gateway.example.test/openrouter/v1/chat/completions",
+    )
+
+    assert request.url == "https://gateway.example.test/openrouter/v1/images"
+
+
+def test_openrouter_4k_rejects_an_ambiguous_custom_endpoint() -> None:
+    with pytest.raises(ValueError, match="Images API URL"):
+        ApiClient.build_generation_request(
+            provider="openrouter",
+            api_key="proxy-key-for-test",
+            model_id="google/gemini-3-pro-image",
+            prompt="a prism",
+            image_size="4K",
+            aspect_ratio="1:1",
+            api_url="https://gateway.example.test/custom-generate",
+        )
 
 
 def test_aihubmix_generation_uses_gemini_native_endpoint_and_payload() -> None:
@@ -145,6 +195,39 @@ def test_edit_payloads_preserve_recovered_provider_differences() -> None:
     )
 
 
+def test_openrouter_4k_edit_uses_ordered_images_api_references() -> None:
+    original = png_bytes(2, 2)
+    annotated = png_bytes(3, 2)
+    request = ApiClient.build_edit_request(
+        provider="openrouter",
+        api_key="test-key",
+        model_id="google/gemini-3.1-flash-image",
+        edit_prompt="replace the marked area",
+        original_image=original,
+        annotated_image=annotated,
+        image_size="4K",
+        aspect_ratio="4:3",
+    )
+
+    assert request.url == "https://openrouter.ai/api/v1/images"
+    assert request.payload["model"] == "google/gemini-3.1-flash-image"
+    assert request.payload["resolution"] == "4K"
+    assert request.payload["aspect_ratio"] == "4:3"
+    assert "IMAGE 1 — ORIGINAL" in request.payload["prompt"]
+    assert "IMAGE 2 — Annotated image" in request.payload["prompt"]
+    references = request.payload["input_references"]
+    assert len(references) == 2
+    assert all(reference["type"] == "image_url" for reference in references)
+    assert references[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert references[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert base64.b64decode(
+        references[0]["image_url"]["url"].split(",", 1)[1], validate=True
+    ) == original
+    assert base64.b64decode(
+        references[1]["image_url"]["url"].split(",", 1)[1], validate=True
+    ) == annotated
+
+
 def test_bmp_edit_inputs_are_normalized_to_provider_compatible_png() -> None:
     common = dict(
         api_key="test-key",
@@ -168,6 +251,34 @@ def test_bmp_edit_inputs_are_normalized_to_provider_compatible_png() -> None:
     assert base64.b64decode(inline["data"], validate=True).startswith(
         b"\x89PNG\r\n\x1a\n"
     )
+
+
+@pytest.mark.parametrize("include_media_type", [True, False])
+def test_openrouter_images_api_response_extracts_b64_image_and_usage(
+    include_media_type: bool,
+) -> None:
+    raw = png_bytes(7, 5)
+    item = {"b64_json": base64.b64encode(raw).decode("ascii")}
+    if include_media_type:
+        item["media_type"] = "image/png"
+    body = json.dumps(
+        {
+            "created": 1_788_000_000,
+            "data": [item],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 34, "cost": 0.1},
+        }
+    )
+
+    result = ApiClient.parse_response(
+        provider="openrouter", body=body, status_code=200
+    )
+
+    assert result.image is not None
+    assert result.image.data == raw
+    assert (result.image.width, result.image.height) == (7, 5)
+    assert result.input_tokens == 12
+    assert result.output_tokens == 34
+    assert result.text == ""
 
 
 @pytest.mark.parametrize(

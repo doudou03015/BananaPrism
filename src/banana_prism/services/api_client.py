@@ -32,6 +32,7 @@ from banana_prism.constants import (
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_IMAGES_URL = "https://openrouter.ai/api/v1/images"
 AIHUBMIX_URL = "https://api.aihubmix.com/gemini/v1beta"
 _DATA_URI_RE = re.compile(
     r"data:(image/[a-zA-Z0-9.+-]+);base64,([^\s\"'<>]+)",
@@ -352,13 +353,31 @@ class ApiClient:
             raise ApiClientError("Image size and aspect ratio are required")
 
         if selected is Provider.OPENROUTER:
-            url = _require_https_api_url(api_url or OPENROUTER_URL)
             headers = {
                 "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
-                "HTTP-Referer": "https://banana-prism.local",
-                "X-Title": "BananaPrism",
+                "HTTP-Referer": "https://github.com/doudou03015/BananaPrism",
+                "X-OpenRouter-Title": "BananaPrism",
             }
+            # OpenRouter's Chat Completions compatibility path currently rejects
+            # 4K for the GA Gemini image slug even though the dedicated Images
+            # API advertises that exact slug and resolution as supported.  Keep
+            # Chat for 1K/2K (it can return explanatory text), while routing 4K
+            # explicitly through the capability-aware Images API.  The requested
+            # model and resolution are preserved; there is no preview-model swap
+            # or silent downgrade.
+            if image_size == "4K":
+                url = ApiClient._openrouter_images_url(api_url or OPENROUTER_URL)
+                payload: Mapping[str, Any] = {
+                    "model": model_id,
+                    "prompt": prompt,
+                    "resolution": image_size,
+                    "aspect_ratio": aspect_ratio,
+                    "n": 1,
+                }
+                return ApiRequest(selected, url, headers, payload)
+
+            url = _require_https_api_url(api_url or OPENROUTER_URL)
             payload: Mapping[str, Any] = {
                 "model": model_id,
                 "modalities": ["image", "text"],
@@ -429,20 +448,35 @@ class ApiClient:
         )
         if selected is Provider.OPENROUTER:
             payload = dict(request.payload)
-            payload["messages"] = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": combined},
-                        {"type": "image_url", "image_url": {"url": original_uri}},
-                        {
-                            "type": "text",
-                            "text": EDIT_ANNOTATION_LABEL,
-                        },
-                        {"type": "image_url", "image_url": {"url": annotation_uri}},
-                    ],
-                }
-            ]
+            if "messages" in payload:
+                payload["messages"] = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": combined},
+                            {"type": "image_url", "image_url": {"url": original_uri}},
+                            {
+                                "type": "text",
+                                "text": EDIT_ANNOTATION_LABEL,
+                            },
+                            {"type": "image_url", "image_url": {"url": annotation_uri}},
+                        ],
+                    }
+                ]
+            else:
+                # The dedicated Images API accepts ordered reference images
+                # separately from the prompt.  Spell out the order so the same
+                # original/annotation semantics survive the protocol switch.
+                payload["prompt"] = (
+                    f"{combined}\n\n"
+                    "[Reference mapping]\n"
+                    "IMAGE 1 — ORIGINAL.\n"
+                    f"IMAGE 2 — {EDIT_ANNOTATION_LABEL}"
+                )
+                payload["input_references"] = [
+                    {"type": "image_url", "image_url": {"url": original_uri}},
+                    {"type": "image_url", "image_url": {"url": annotation_uri}},
+                ]
         else:
             payload = dict(request.payload)
             payload["contents"] = [
@@ -467,6 +501,24 @@ class ApiClient:
                 }
             ]
         return ApiRequest(request.provider, request.url, request.headers, payload)
+
+    @staticmethod
+    def _openrouter_images_url(api_url: str) -> str:
+        """Return the same-origin Images API URL for an OpenRouter chat URL.
+
+        Presets may point at an OpenRouter-compatible proxy.  Never move a
+        credential to a different origin: translate only the conventional
+        ``/chat/completions`` suffix on the configured HTTPS endpoint.
+        """
+
+        validated = _require_https_api_url(api_url)
+        if validated == OPENROUTER_IMAGES_URL:
+            return validated
+        if validated.endswith("/chat/completions"):
+            return validated[: -len("/chat/completions")] + "/images"
+        raise ApiClientError(
+            "OpenRouter 4K requires an Images API URL or a Chat Completions URL"
+        )
 
     @staticmethod
     def _aihubmix_native_url(api_url: str, model_id: str) -> str:
@@ -781,7 +833,26 @@ class ApiClient:
     def _candidate_strategies(
         documents: Sequence[dict[str, Any]],
     ) -> Iterable[list[_ImageCandidate]]:
-        # 1. OpenRouter's message.images extension.
+        # 1. OpenRouter's dedicated Images API: data[].b64_json/media_type.
+        strategy: list[_ImageCandidate] = []
+        for document in documents:
+            data = document.get("data")
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    encoded = item.get("b64_json")
+                    if isinstance(encoded, str):
+                        media_type = item.get("media_type")
+                        strategy.append(
+                            _ImageCandidate(
+                                encoded,
+                                media_type if isinstance(media_type, str) else None,
+                            )
+                        )
+        yield strategy
+
+        # 2. OpenRouter's message.images extension.
         strategy: list[_ImageCandidate] = []
         for document in documents:
             for _choice, node in ApiClient._choice_nodes(document):
@@ -791,7 +862,7 @@ class ApiClient:
                         strategy.extend(ApiClient._coerce_candidate(image))
         yield strategy
 
-        # 2. Multimodal entries in message.content[].
+        # 3. Multimodal entries in message.content[].
         strategy = []
         for document in documents:
             for _choice, node in ApiClient._choice_nodes(document):
@@ -801,7 +872,7 @@ class ApiClient:
                         strategy.extend(ApiClient._coerce_candidate(part))
         yield strategy
 
-        # 3. Data URI embedded in a string content response.
+        # 4. Data URI embedded in a string content response.
         strategy = []
         for document in documents:
             for _choice, node in ApiClient._choice_nodes(document):
@@ -813,7 +884,7 @@ class ApiClient:
                     )
         yield strategy
 
-        # 4. Image directly attached to a choice/candidate.
+        # 5. Image directly attached to a choice/candidate.
         strategy = []
         for document in documents:
             for choice, _node in ApiClient._choice_nodes(document):
@@ -822,7 +893,7 @@ class ApiClient:
                         strategy.extend(ApiClient._coerce_candidate(choice[key]))
         yield strategy
 
-        # 5. OpenRouter multi_mod_content or Gemini native content.parts inlineData.
+        # 6. OpenRouter multi_mod_content or Gemini native content.parts inlineData.
         strategy = []
         for document in documents:
             for _choice, node in ApiClient._choice_nodes(document):
@@ -839,6 +910,7 @@ class ApiClient:
 
 __all__ = [
     "AIHUBMIX_URL",
+    "OPENROUTER_IMAGES_URL",
     "OPENROUTER_URL",
     "ApiClient",
     "ApiClientError",

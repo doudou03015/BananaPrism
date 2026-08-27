@@ -77,7 +77,7 @@ def generation_result() -> GenerationResult:
         provider="openrouter",
     )
     return GenerationResult(
-        image_bytes=encoded_image("png", 64, 48, dpi=150.0),
+        image_bytes=encoded_image("png", 64, 48, dpi=300.0),
         fmt="png",
         width=64,
         height=48,
@@ -85,7 +85,7 @@ def generation_result() -> GenerationResult:
         text_content="done",
         usage=TokenUsage(input_tokens=12, output_tokens=3),
         timestamp=datetime(2026, 8, 26, 12, 34, 56),
-        output_dpi=(150.0, 150.0),
+        output_dpi=(300.0, 300.0),
     )
 
 
@@ -130,7 +130,7 @@ def test_image_and_sidecar_commit_include_integrity_and_provenance(tmp_path: Pat
     assert metadata["provider"] == "openrouter"
     assert metadata["preset_id"] == "preset_abc"
     assert metadata["image_sha256"] == hashlib.sha256(result.image_bytes).hexdigest()
-    assert metadata["output_dpi"] == [150.0, 150.0]
+    assert metadata["output_dpi"] == [300.0, 300.0]
     assert metadata["token_usage"] == {"input_tokens": 12, "output_tokens": 3}
     assert result.saved_path == str(image_path)
 
