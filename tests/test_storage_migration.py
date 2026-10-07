@@ -104,6 +104,7 @@ def test_migration_encrypts_backup_verifies_then_scrubs_and_is_idempotent(
     assert settings.get_api_key("preset_0") == "primary-key"
     assert settings.get_api_key("preset_1") == "backup-key"
     assert settings.api_key == "primary-key"
+    assert settings.last_model_index == 1
     assert b"primary-key" not in settings.path.read_bytes()
     assert b"primary-key" not in store.path.read_bytes()
     assert b"stale-root-key-must-not-win" not in store.path.read_bytes()

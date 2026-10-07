@@ -25,11 +25,12 @@ from PySide6.QtGui import QImage, QImageReader, QPainter
 from banana_prism.constants import (
     MAX_IMAGE_PIXELS,
     MAX_RESPONSE_BYTES,
+    NANO_BANANA_21_MODEL_ID,
     SIZES,
 )
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_IMAGES_URL = "https://openrouter.ai/api/v1/images"
-AIHUBMIX_URL = "https://api.aihubmix.com/gemini/v1beta"
+AIHUBMIX_URL = "https://aihubmix.com/gemini/v1beta"
 _DATA_URI_RE = re.compile(
     r"data:(image/[a-zA-Z0-9.+-]+);base64,([^\s\"'<>]+)",
     re.IGNORECASE,
@@ -520,14 +521,11 @@ class ApiClient:
                 "HTTP-Referer": "https://github.com/doudou03015/BananaPrism",
                 "X-OpenRouter-Title": "BananaPrism",
             }
-            # OpenRouter's Chat Completions compatibility path currently rejects
-            # 4K for the GA Gemini image slug even though the dedicated Images
-            # API advertises that exact slug and resolution as supported.  Keep
-            # Chat for 1K/2K (it can return explanatory text), while routing 4K
-            # explicitly through the capability-aware Images API.  The requested
-            # model and resolution are preserved; there is no preview-model swap
-            # or silent downgrade.
-            if image_size == "4K":
+            # Nano Banana 2.1's Images endpoint explicitly advertises 1K/2K/4K
+            # and reference images. Use that verified path at every resolution.
+            # Preserve older models' Chat path for 1K/2K and Images path for 4K.
+            # Never substitute another model or silently lower the resolution.
+            if image_size == "4K" or model_id == NANO_BANANA_21_MODEL_ID:
                 url = ApiClient._openrouter_images_url(api_url or OPENROUTER_URL)
                 payload: Mapping[str, Any] = {
                     "model": model_id,
@@ -702,13 +700,15 @@ class ApiClient:
         ``/chat/completions`` suffix on the configured HTTPS endpoint.
         """
 
-        validated = _require_https_api_url(api_url)
-        if validated == OPENROUTER_IMAGES_URL:
-            return validated
-        if validated.endswith("/chat/completions"):
-            return validated[: -len("/chat/completions")] + "/images"
+        base = urlsplit(_require_https_api_url(api_url))
+        path = base.path.rstrip("/")
+        if path.endswith("/images"):
+            return base._replace(path=path).geturl()
+        if path.endswith("/chat/completions"):
+            path = path[: -len("/chat/completions")] + "/images"
+            return base._replace(path=path).geturl()
         raise ApiClientError(
-            "OpenRouter 4K requires an Images API URL or a Chat Completions URL"
+            "OpenRouter image generation requires an Images API URL or a Chat Completions URL"
         )
 
     @staticmethod
@@ -718,7 +718,14 @@ class ApiClient:
         if not native_model:
             raise ApiClientError("AiHubMix requires a Gemini model ID")
         encoded_model = quote(native_model, safe="._-")
-        return f"{base.scheme}://{base.netloc}/gemini/v1beta/models/{encoded_model}:streamGenerateContent"
+        # Buffer the complete 2.1 output: image generation must not mistake a
+        # stream containing only thinking parts for a completed image response.
+        method = (
+            "generateContent"
+            if native_model == NANO_BANANA_21_MODEL_ID.removeprefix("google/")
+            else "streamGenerateContent"
+        )
+        return f"{base.scheme}://{base.netloc}/gemini/v1beta/models/{encoded_model}:{method}"
 
     @staticmethod
     def parse_response(
@@ -948,13 +955,21 @@ class ApiClient:
                         pieces.append(cleaned)
                 elif isinstance(content, list):
                     for part in content:
-                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        if (
+                            isinstance(part, dict)
+                            and not part.get("thought")
+                            and isinstance(part.get("text"), str)
+                        ):
                             pieces.append(part["text"])
                 for key in ("parts", "multi_mod_content"):
                     parts = node.get(key)
                     if isinstance(parts, list):
                         for part in parts:
-                            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            if (
+                                isinstance(part, dict)
+                                and not part.get("thought")
+                                and isinstance(part.get("text"), str)
+                            ):
                                 pieces.append(part["text"])
         return "".join(pieces).strip()
 
@@ -1004,6 +1019,10 @@ class ApiClient:
                 return [_ImageCandidate(value, mime)]
             return []
         if not isinstance(value, dict):
+            return []
+        # Gemini may return intermediate image drafts among thinking parts.
+        # Those are not final outputs, even when larger than the final image.
+        if value.get("thought"):
             return []
         declared = (
             value.get("mime_type")

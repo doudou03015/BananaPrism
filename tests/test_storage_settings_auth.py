@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from banana_prism.constants import DEFAULT_MODEL_INDEX, MODELS
 from banana_prism.services.auth_service import (
     LEGACY_PBKDF2_ITERATIONS,
     PBKDF2_ITERATIONS,
@@ -154,7 +155,7 @@ def test_preset_provider_change_requires_new_key_and_failed_settings_commit_roll
 
 def test_settings_defaults_validation_and_today_rollover(tmp_path: Path) -> None:
     _, settings = make_services(tmp_path)
-    assert settings.last_model_index == 0
+    assert settings.last_model_index == DEFAULT_MODEL_INDEX
     assert settings.last_size_index == 0
     assert settings.last_ratio == "1:1"
     assert settings.last_output_format == "png"
@@ -210,6 +211,42 @@ def test_grouped_settings_update_is_atomic_on_validation_failure(tmp_path: Path)
 
     assert settings.path.read_bytes() == before
     assert settings.save_dir != str(tmp_path / "images")
+
+
+@pytest.mark.parametrize(
+    ("model_index", "model_id"),
+    [
+        (0, "google/gemini-3.1-flash-image"),
+        (1, "google/gemini-2.5-flash-image"),
+        (2, "google/gemini-3-pro-image"),
+    ],
+)
+def test_existing_settings_keep_model_selection_when_optional_preferences_are_filled(
+    tmp_path: Path, model_index: int, model_id: str
+) -> None:
+    _, settings = make_services(tmp_path)
+    document = settings.as_dict()
+    document["last_model_index"] = model_index
+    for optional_preference in (
+        "last_output_format", "last_output_dpi", "last_annotation_color"
+    ):
+        document.pop(optional_preference)
+    settings.path.write_text(json.dumps(document), encoding="utf-8")
+
+    _, reopened = make_services(tmp_path)
+    assert reopened.last_model_index == model_index
+    assert MODELS[reopened.last_model_index].model_id == model_id
+    assert reopened.last_output_format == "png"
+
+
+def test_nano_banana_21_selection_round_trips_through_settings(tmp_path: Path) -> None:
+    _, settings = make_services(tmp_path)
+    settings.last_model_index = 0
+    settings.last_model_index = DEFAULT_MODEL_INDEX
+
+    _, reopened = make_services(tmp_path)
+    assert MODELS[reopened.last_model_index].model_id == "google/gemini-nano-banana-2.1"
+    assert json.loads(reopened.path.read_text(encoding="utf-8"))["last_model_index"] == 3
 
 
 def test_legacy_password_verifies_then_upgrades_to_600k(tmp_path: Path) -> None:

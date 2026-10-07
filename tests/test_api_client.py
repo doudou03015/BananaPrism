@@ -125,7 +125,7 @@ def test_aihubmix_generation_uses_gemini_native_endpoint_and_payload() -> None:
         aspect_ratio="1:1",
     )
     assert request.url == (
-        "https://api.aihubmix.com/gemini/v1beta/models/"
+        "https://aihubmix.com/gemini/v1beta/models/"
         "gemini-current-ga-image:streamGenerateContent"
     )
     assert request.headers == {

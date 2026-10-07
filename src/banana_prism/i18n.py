@@ -28,6 +28,7 @@ _ZH_CN = {
     "model.gemini_31_flash": "Nano Banana 2（Gemini 3.1 Flash Image）",
     "model.gemini_25_flash": "Nano Banana（Gemini 2.5 Flash Image）",
     "model.gemini_3_pro": "Nano Banana Pro（Gemini 3 Pro Image）",
+    "model.gemini_nano_banana_21": "Nano Banana 2.1（Gemini Nano Banana 2.1）",
     "application.startup_failed.title": "BananaPrism 启动失败",
     "application.startup_failed.body": (
         "BananaPrism 无法安全启动。配置迁移或凭据存储未完成，旧配置未被删除。\n\n"
@@ -117,7 +118,7 @@ _ZH_CN = {
     "api_preset.placeholder.enter_key": "输入 API Key",
     "api_preset.field.name": "预设名称",
     "api_preset.field.provider": "服务商",
-    "api_preset.field.endpoint": "接口地址",
+    "api_preset.field.endpoint": "API 基础地址",
     "api_preset.note.security": "密钥应由安全存储服务保存；此窗口不会把密钥写入普通设置或日志。",
     "api_preset.error.missing_name.title": "缺少名称",
     "api_preset.error.missing_name.body": "请输入预设名称。",

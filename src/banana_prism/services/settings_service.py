@@ -18,6 +18,7 @@ from typing import Any, cast
 
 from banana_prism.constants import (
     API_PROVIDERS,
+    DEFAULT_MODEL_INDEX,
     DEFAULT_RATIO,
     LEGACY_APP_ID,
     MODELS,
@@ -316,7 +317,7 @@ def default_settings_document(*, on_date: date | None = None) -> dict[str, Any]:
     current_date = on_date or date.today()
     return {
         "schema_version": SETTINGS_SCHEMA_VERSION,
-        "last_model_index": 0,
+        "last_model_index": DEFAULT_MODEL_INDEX,
         "last_size_index": 0,
         "last_ratio": DEFAULT_RATIO,
         "last_output_format": "png",

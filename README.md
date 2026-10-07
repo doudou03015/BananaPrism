@@ -11,7 +11,7 @@ AiHubMix 调用 Gemini 图像模型，完成文生图、局部标注编辑、串
 
 ### 功能
 
-- 三档 Gemini 图像模型、六种宽高比；Gemini 3 系列支持 1K/2K/4K，
+- 四款 Gemini 图像模型（含 Nano Banana 2.1）、六种宽高比；Nano Banana 2.1 和 Gemini 3 系列支持 1K/2K/4K，
   Gemini 2.5 Flash Image 按官方能力仅开放 1K。
 - 本地 PNG/JPEG/WEBP/BMP 导入。
 - 矩形、笔刷、橡皮擦与轻量撤销；标注颜色可选红、绿、洋红、青、黄，默认红色。
@@ -25,14 +25,27 @@ AiHubMix 调用 Gemini 图像模型，完成文生图、局部标注编辑、串
 - 生成和编辑可选择 PNG/JPEG 及 72/96/150/300 DPI，并显示所选 1K/2K/4K 与比例的参考像素尺寸；
   只修改保存容器和 DPI 元数据，不缩放服务商返回的像素。若容器未保留请求 DPI，日志和 JSON sidecar
   会记录真实回读值。
-- OpenRouter 的 4K 生成与编辑使用官方 Images API，不替换 Preview 模型、不降低分辨率；
-  该接口只返回图片，因此 4K 结果通常没有模型文字说明。
+- Nano Banana 2.1 在 OpenRouter 的所有尺寸、旧模型的 4K 生成与编辑使用官方 Images API，
+  保留所选模型和分辨率；该接口只返回图片，通常没有模型文字说明。
+- AiHubMix 使用官方稳定域名；Nano Banana 2.1 使用 Gemini 原生非流式接口，解析时排除思考阶段的中间图片和文字。
 - 模型、尺寸、比例、保存格式、DPI 与标注颜色会自动记住上次选择；队列冻结入队时的参数。
 - 图片放大后可在查看模式按住鼠标左键拖动画布。
 - OpenRouter 4K 编辑显示上传、服务商生成、结果下载三个阶段，并允许最长 15 分钟后安全超时或手动取消。
 - 启动时自动居中并最大化；API 故障区分 HTTP 状态、DNS、TLS、超时和连接错误。
 - 单实例运行，避免两个进程并发覆盖设置与凭据。
 - 简体中文文案集中在语言目录，可注册其他 locale 并逐项回退中文。
+
+### 使用 Nano Banana 2.1
+
+在控制台添加 OpenRouter 或 AiHubMix 预设并填写对应平台的 API Key，然后在模型下拉框选择
+“Nano Banana 2.1”。全新配置默认选择该模型；升级时保留已有模型选择和预设。
+
+- OpenRouter 模型 ID：`google/gemini-nano-banana-2.1`。
+- AiHubMix 模型 ID：`gemini-nano-banana-2.1`，应用自动转换平台所需的名称。
+- 生成、标注编辑和队列共享 1K/2K/4K 设置；两张编辑参考图仍受 16 MiB 请求预算保护。
+
+接入依据、验证范围及实机验收步骤见 [Nano Banana 2.1 适配说明](docs/nano-banana-2.1.md)。
+API Key 使用 Windows 当前用户加密，换电脑或 Windows 账户后应重新在预设中填写。
 
 ### 开发运行
 
@@ -91,7 +104,7 @@ The application version has a single source of truth in `pyproject.toml`. The bu
 
 ### Features
 
-- Three Gemini image model tiers and six aspect ratios. Gemini 3 models support 1K/2K/4K; Gemini 2.5 Flash Image is limited to 1K according to its published capabilities.
+- Four Gemini image models, including Nano Banana 2.1, and six aspect ratios. Nano Banana 2.1 and Gemini 3 models support 1K/2K/4K; Gemini 2.5 Flash Image is limited to 1K according to its published capabilities.
 - Local PNG/JPEG/WEBP/BMP import.
 - Rectangle, brush, eraser, and lightweight undo tools. Annotation colors include red, green, magenta, cyan, and yellow; red is the default.
 - Edit requests upload exactly two JPEG 95 network copies: the original image and a colored annotation guide. The binary selection mask remains local for generating and validating the guide and is never uploaded. Transparent inputs use the same white-background compositing policy for both copies.
@@ -102,13 +115,25 @@ The application version has a single source of truth in `pyproject.toml`. The bu
 - Multiple OpenRouter/AiHubMix API presets and a password-protected console. After authentication, the selected key can be viewed in masked form, revealed, and copied.
 - Automatic image and JSON sidecar saving. API keys are encrypted with Windows DPAPI CurrentUser.
 - PNG/JPEG output and 72/96/150/300 DPI choices for generation and editing, with reference pixel dimensions for the selected 1K/2K/4K size and aspect ratio. These options change only the saved container and DPI metadata; they do not rescale provider-returned pixels. If a container cannot retain the requested DPI, the actual decoded value is recorded in the log and JSON sidecar.
-- OpenRouter 4K generation and editing use the official Images API without substituting a Preview model or lowering the resolution. This endpoint normally returns image data only, so 4K results may not include a model text explanation.
+- Nano Banana 2.1 uses OpenRouter's official Images API at every resolution; older models retain that route for 4K. The selected model and resolution are preserved. This endpoint normally returns image data without a text explanation.
+- AiHubMix uses its stable domain. Nano Banana 2.1 uses non-streaming Gemini Native requests; intermediate thinking images and text are excluded from results.
 - The last model, size, ratio, output format, DPI, and annotation color are restored automatically. Queue items freeze their parameters when added.
 - When an image is zoomed in, hold the left mouse button in view mode to pan the canvas.
 - OpenRouter 4K editing reports upload, provider processing, and download phases, with safe cancellation or a maximum 15-minute timeout.
 - The main window starts centered and maximized. API diagnostics distinguish HTTP status errors, DNS failures, TLS failures, timeouts, and connection errors.
 - Single-instance operation prevents concurrent processes from overwriting settings or credentials.
 - Simplified Chinese strings are centralized in the locale catalog, with registration and per-key fallback support for future languages.
+
+### Using Nano Banana 2.1
+
+Add an OpenRouter or AiHubMix preset with that provider's API key in the console, then select
+Nano Banana 2.1. Fresh profiles select it by default; existing profiles keep their model selection.
+The app uses `google/gemini-nano-banana-2.1` on OpenRouter and `gemini-nano-banana-2.1` on AiHubMix.
+Generation, region-guided edits, and queued tasks support 1K/2K/4K.
+
+See the [integration notes](docs/nano-banana-2.1.md) for protocol sources, verification scope,
+and live acceptance steps. Keys are encrypted for the current Windows user and must be entered
+again after moving to another computer or Windows account.
 
 ### Development
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image
 
 from banana_prism import __version__
-from banana_prism.constants import MODELS, RATIOS, SIZES, SIZE_DIMENSIONS
+from banana_prism.constants import DEFAULT_MODEL_INDEX, MODELS, RATIOS, SIZES, SIZE_DIMENSIONS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,12 +26,15 @@ def test_frozen_spec_bundles_the_version_source():
     assert '"--smoke-test"' in verifier
 
 
-def test_builtin_model_ids_are_current_ga_ids():
+def test_builtin_models_preserve_persisted_indices_and_append_nano_banana_21():
     assert [model.model_id for model in MODELS] == [
         "google/gemini-3.1-flash-image",
         "google/gemini-2.5-flash-image",
         "google/gemini-3-pro-image",
+        "google/gemini-nano-banana-2.1",
     ]
+    assert MODELS[DEFAULT_MODEL_INDEX].model_id == "google/gemini-nano-banana-2.1"
+    assert MODELS[DEFAULT_MODEL_INDEX].supported_sizes == SIZES
 
 
 def test_all_size_ratio_combinations_have_dimensions():

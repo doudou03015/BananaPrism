@@ -48,11 +48,15 @@ API_PROVIDERS: dict[str, ProviderSpec] = {
     "aihubmix": ProviderSpec(
         provider_id="aihubmix",
         label="AiHubMix",
-        api_url="https://api.aihubmix.com/gemini/v1beta/models/{model}:streamGenerateContent",
+        api_url="https://aihubmix.com/gemini/v1beta/models/{model}:streamGenerateContent",
         key_url="https://aihubmix.com/user/token",
     ),
 }
 
+NANO_BANANA_21_MODEL_ID = "google/gemini-nano-banana-2.1"
+
+# Settings and queued tasks store indices into this tuple. Keep existing entries
+# in place and append new models so upgrades preserve the selected model.
 MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(
         "model.gemini_31_flash",
@@ -70,7 +74,13 @@ MODELS: tuple[ModelSpec, ...] = (
         "google/gemini-3-pro-image",
         "NanoBananaPro",
     ),
+    ModelSpec(
+        "model.gemini_nano_banana_21",
+        NANO_BANANA_21_MODEL_ID,
+        "NanoBanana2.1",
+    ),
 )
+DEFAULT_MODEL_INDEX = 3
 
 SIZES = ("1K", "2K", "4K")
 RATIOS = ("16:9", "1:1", "4:3", "3:2", "9:16", "3:4")

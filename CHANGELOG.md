@@ -2,6 +2,26 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/)。
 
+## [1.2.0] - 2026-10-07
+
+### Added
+
+- 新增 Nano Banana 2.1，支持 OpenRouter 和 AiHubMix 的 1K/2K/4K 文生图、局部标注编辑及串行队列。
+- 全新配置默认选择 Nano Banana 2.1；模型列表末尾追加新条目，保留原三个模型索引及已有选择，设置格式保持兼容。
+- 增加双平台新模型协议、图片解析、配置恢复及队列回归测试，并记录官方接入依据与实机验收步骤。
+
+### Changed
+
+- Nano Banana 2.1 在 OpenRouter 的全部尺寸统一使用官方 Images API，保留旧模型的 1K/2K Chat Completions 与 4K Images API 路由。
+- AiHubMix 改用官方稳定域名 `aihubmix.com`；Nano Banana 2.1 使用原生 `generateContent` 非流式接口，保持原有两张 JPEG 编辑参考图与请求体预算。
+
+### Fixed
+
+- 忽略 Gemini 响应中 `thought: true` 的中间图片和文字，防止较大的思考草图覆盖最终成图。
+- OpenRouter 自定义 HTTPS 端点按 URL 路径转换 Images API，保留原域名及查询参数，并支持已配置的 Images API 路径。
+- 构建在图标生成后记录源码指纹，避免更换工具链后生成资源变化导致发布校验误报。
+- 隔离打包时的 DLL 搜索路径，防止电脑上其他软件的 ICU/OpenSSL/CRT 被误打包，造成 Qt 启动失败。
+
 ## [1.1.2] - 2026-08-27
 
 ### Fixed

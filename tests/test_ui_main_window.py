@@ -13,7 +13,7 @@ from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QObject, QPoint, Sign
 from PySide6.QtGui import QColor, QCloseEvent, QImage, QImageReader
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox, QScrollArea
 
-from banana_prism.constants import MODELS
+from banana_prism.constants import DEFAULT_MODEL_INDEX, MODELS
 from banana_prism import __version__
 from banana_prism.models import (
     ApiPreset,
@@ -23,6 +23,7 @@ from banana_prism.models import (
 )
 from banana_prism.services.file_service import FileService
 from banana_prism.services.log_service import REDACTION, register_process_secret
+from banana_prism.services.settings_service import default_settings_document
 from banana_prism.ui.main_window import MainWindow
 
 
@@ -202,6 +203,65 @@ def _process(app: QApplication) -> None:
         app.processEvents()
 
 
+@pytest.mark.parametrize(
+    ("model_index", "model_id"),
+    [
+        (0, "google/gemini-3.1-flash-image"),
+        (1, "google/gemini-2.5-flash-image"),
+        (2, "google/gemini-3-pro-image"),
+        (3, "google/gemini-nano-banana-2.1"),
+    ],
+)
+def test_model_selection_restores_persisted_index(
+    app: QApplication, model_index: int, model_id: str
+) -> None:
+    settings = FakeSettings()
+    settings.values["last_model_index"] = model_index
+    window = MainWindow(settings, FakeImageService())
+
+    assert window._model_combo.currentIndex() == model_index
+    assert window._model_combo.currentData() == model_id
+    assert window._current_model().model_id == model_id
+    window.close()
+
+
+def test_new_install_selects_nano_banana_21(app: QApplication) -> None:
+    settings = FakeSettings()
+    settings.values.update(default_settings_document())
+    window = MainWindow(settings, FakeImageService())
+
+    assert window._model_combo.currentData() == "google/gemini-nano-banana-2.1"
+    assert "Nano Banana 2.1" in window._model_combo.currentText()
+    assert [window._size_combo.itemText(i) for i in range(window._size_combo.count())] == [
+        "1K", "2K", "4K"
+    ]
+    window.close()
+
+
+@pytest.mark.parametrize(("preset_id", "provider"), [("p1", "openrouter"), ("p2", "aihubmix")])
+@pytest.mark.parametrize("size", ["1K", "2K", "4K"])
+def test_nano_banana_21_selection_persists_and_dispatches_to_both_providers(
+    app: QApplication, preset_id: str, provider: str, size: str
+) -> None:
+    window, settings, service = _window()
+    window._preset_combo.setCurrentIndex(window._preset_combo.findData(preset_id))
+    window._model_combo.setCurrentIndex(DEFAULT_MODEL_INDEX)
+    window._size_combo.setCurrentText(size)
+    window._prompt_edit.setPlainText("a glass banana in a prism")
+
+    assert settings.values["last_model_index"] == DEFAULT_MODEL_INDEX
+    assert window.begin_generation()
+    request = window._current_job.request
+    kind, kwargs = service.calls[-1]
+    assert kind == "generation"
+    assert kwargs["model_id"] == request.model_id == "google/gemini-nano-banana-2.1"
+    assert request.model_short_name == "NanoBanana2.1"
+    assert kwargs["provider"] == request.provider == provider
+    assert kwargs["image_size"] == request.size == size
+    service.cancel()
+    window.close()
+
+
 def test_visible_shared_parameters_are_dispatched_exactly_without_generation_preflight(
     app: QApplication,
 ) -> None:
@@ -318,10 +378,12 @@ def test_legacy_25_model_exposes_only_supported_1k_size(app: QApplication) -> No
     assert window._size_combo.currentText() == "1K"
 
 
+@pytest.mark.parametrize("model_index", [0, DEFAULT_MODEL_INDEX])
 def test_edit_mandatory_preflight_sends_same_request_and_png_guide(
-    app: QApplication, monkeypatch: pytest.MonkeyPatch
+    app: QApplication, monkeypatch: pytest.MonkeyPatch, model_index: int
 ) -> None:
     window, _settings, service = _window()
+    window._model_combo.setCurrentIndex(model_index)
     source = png_bytes(96, 72)
     window._work_bytes = source
     window._work_fmt = "png"
@@ -349,6 +411,7 @@ def test_edit_mandatory_preflight_sends_same_request_and_png_guide(
     assert window.begin_edit()
     kind, kwargs = service.calls[-1]
     assert kind == "edit"
+    assert kwargs["model_id"] == captured[0].model_id == MODELS[model_index].model_id
     assert kwargs["annotated_image"].startswith(b"\x89PNG\r\n\x1a\n")
     assert kwargs["selection_mask"].startswith(b"\x89PNG\r\n\x1a\n")
     mask = QImage.fromData(kwargs["selection_mask"])
@@ -427,6 +490,30 @@ def test_queue_freezes_output_encoding_choices(app: QApplication) -> None:
     assert frozen.output_format == request.requested_output_format == "jpeg"
     assert frozen.output_dpi == request.requested_dpi == 96.0
     service.cancel()
+
+
+def test_queue_keeps_nano_banana_21_model_and_size_after_selection_changes(
+    app: QApplication,
+) -> None:
+    window, _settings, service = _window()
+    window._model_combo.setCurrentIndex(DEFAULT_MODEL_INDEX)
+    window._size_combo.setCurrentText("4K")
+    window._prompt_edit.setPlainText("queued with Nano Banana 2.1 at 4K")
+    window._on_add_queue()
+
+    frozen = window._queue[0]
+    window._model_combo.setCurrentIndex(1)
+    assert window._size_combo.currentText() == "1K"
+    window._on_start_queue()
+
+    request = window._current_job.request
+    kind, kwargs = service.calls[-1]
+    assert kind == "generation"
+    assert frozen.model_index == DEFAULT_MODEL_INDEX
+    assert kwargs["model_id"] == request.model_id == "google/gemini-nano-banana-2.1"
+    assert kwargs["image_size"] == request.size == "4K"
+    service.cancel()
+    window.close()
 
 
 def test_ten_queue_items_run_strictly_once_and_serially(app: QApplication) -> None:

@@ -97,7 +97,13 @@ class ApiPresetDialog(QDialog):
 
     def _refresh_endpoint(self) -> None:
         spec = API_PROVIDERS.get(str(self.provider_combo.currentData()))
-        self.endpoint_label.setText(spec.api_url if spec else "")
+        # The operation endpoint depends on model and resolution. Display the
+        # shared API base here instead of promising one operation for all calls.
+        base_url = (
+            spec.api_url.split("/models/", 1)[0].removesuffix("/chat/completions")
+            if spec else ""
+        )
+        self.endpoint_label.setText(base_url)
 
     def _validate_and_accept(self) -> None:
         if not self.name_edit.text().strip():
